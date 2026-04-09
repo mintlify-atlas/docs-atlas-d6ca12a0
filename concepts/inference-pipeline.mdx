@@ -1,0 +1,151 @@
+---
+title: "How LLogos transforms tokens into generated text"
+description: "Step-by-step walkthrough of the LLogos inference pipeline: tokenization, embedding, transformer layers, KV cache, sampling strategies, and streamed output."
+keywords: ["inference pipeline", "tokenizer", "transformer", "KV cache", "sampling", "prefill", "decode", "GQA", "SwiGLU", "RoPE"]
+---
+
+Every call to the LLogos inference engine follows the same path: raw text enters as a string, passes through a BPE tokenizer, travels through a stack of transformer layers that read and write a KV cache, then arrives at a sampler that selects the next token — one at a time — until the model signals completion. This page traces that path in full.
+
+## Pipeline stages
+
+```
+Input text → Tokenize → Embed → Transformer stack (×N layers) → Final RMSNorm → LM head → Sample → Detokenize → Output text
+```
+
+At a high level:
+
+1. **Tokenize** — The BPE tokenizer splits input text into token IDs using the vocabulary and merge rules embedded in the GGUF file's metadata.
+2. **Embed** — Each token ID is looked up in the embedding matrix (`token_embd.weight`) to produce a hidden-state vector of size `hidden_dim`.
+3. **Transformer stack** — The hidden state passes through N identical layers. Each layer applies self-attention and a feed-forward network (SwiGLU), with residual connections and RMSNorm at each sub-block.
+4. **Final RMSNorm** — The output of the last transformer layer is normalized using `output_norm.weight`.
+5. **LM head** — A linear projection (`output.weight`) maps the normalized hidden state to a logit vector of size `vocab_size`.
+6. **Sample** — The sampler applies temperature, top-k, top-p, and repetition penalty to the logit vector, then draws a token ID.
+7. **Detokenize** — Selected token IDs are converted back to text and streamed to the caller.
+
+## Prefill vs decode
+
+LLogos runs the transformer in two distinct phases with different performance characteristics:
+
+| Aspect | Prefill | Decode |
+|--------|---------|--------|
+| **Tokens processed** | All prompt tokens at once | One new token per step |
+| **Computation** | Large matrix multiplications (compute-bound) | Small vector-matrix operations (memory-bound) |
+| **KV cache** | Written for all positions | Appended one position, read entirely |
+| **Bottleneck** | GPU compute (TFLOPS) | Memory bandwidth (GB/s) |
+| **Batch dimension** | `seq_len` (hundreds to thousands) | 1 |
+| **Backend optimization** | Large GEMMs, high occupancy | Fused kernels, memory coalescing |
+
+During prefill, the attention score computation is a `[P × D] × [D × P]` matmul — compute-intensive but highly parallelizable. During decode, it becomes a `[1 × D] × [D × S]` matmul where S grows with context, so the bottleneck shifts to reading the KV cache from memory.
+
+## Per-layer detail
+
+Each transformer layer receives a hidden state and returns an updated hidden state of the same shape. The operations are:
+
+### Self-attention block
+
+1. **RMSNorm** — Normalize the input using `attn_norm.weight`.
+2. **Q/K/V projections** — Three separate matrix multiplications produce query, key, and value tensors.
+3. **RoPE** — Rotate Q and K in-place to encode position. See the [RoPE section](#rope-rotary-position-embedding) below.
+4. **KV cache write** — Store the current position's K and V vectors into the per-layer KV cache.
+5. **Scaled dot-product attention** — Compute `softmax(Q × Kᵀ / √d_head) × V` over all cached positions (with a causal mask during prefill).
+6. **Output projection** — Project the concatenated attention output back to `hidden_dim`.
+7. **Residual add** — Add the pre-attention input to the attention output.
+
+### Feed-forward block (SwiGLU)
+
+1. **RMSNorm** — Normalize the residual-added output using `ffn_norm.weight`.
+2. **Gate and up projections** — Two parallel matrix multiplications expand to `intermediate_dim`.
+3. **SwiGLU** — `SiLU(gate) ⊙ up`, where `SiLU(x) = x × σ(x)`.
+4. **Down projection** — Compress back to `hidden_dim`.
+5. **Residual add** — Add the pre-FFN hidden state to the FFN output.
+
+```
+gate  = W_gate × input       [hidden_dim → intermediate_dim]
+up    = W_up × input         [hidden_dim → intermediate_dim]
+fused = SiLU(gate) ⊙ up      [element-wise multiply]
+output = W_down × fused      [intermediate_dim → hidden_dim]
+```
+
+For Qwen 3.5 0.8B: `hidden_dim = 1024`, `intermediate_dim = 3072`. Each layer has three FFN weight matrices of shape 1024×3072.
+
+## Grouped Query Attention (GQA)
+
+Standard multi-head attention computes one K and V head per Q head, which scales the KV cache linearly with the number of query heads. Grouped Query Attention reduces this by sharing K/V heads across groups of query heads.
+
+Qwen 3.5 0.8B uses a 2:1 ratio: 16 query heads share 8 KV heads. Each pair of query heads uses the same K and V head for attention.
+
+**Memory impact:** With 8 KV heads instead of 16, the KV cache is half the size of standard MHA, at the same `hidden_dim` and context length.
+
+**Computation during decode:** LLogos tiles (repeats) each KV head once to match the query head count before computing attention. This keeps the attention kernel simple while preserving the GQA memory benefit.
+
+## RoPE (Rotary Position Embedding)
+
+RoPE encodes position by rotating pairs of dimensions in Q and K vectors using sinusoidal frequencies. No explicit position tokens are added to the sequence.
+
+```
+For dimension pair (2i, 2i+1) at position p:
+    θ_i = rope_base^(-2i / d_head)
+    q_rot[2i]   = q[2i] × cos(p × θ_i) - q[2i+1] × sin(p × θ_i)
+    q_rot[2i+1] = q[2i] × sin(p × θ_i) + q[2i+1] × cos(p × θ_i)
+```
+
+The `rope_base` (theta) for Qwen 3.5 is `1,000,000` — a high value that extends effective context length by reducing the rate at which low-frequency dimensions complete a full rotation.
+
+## KV cache
+
+The KV cache stores the K and V tensors for every previously processed token, so the attention computation on each decode step only needs to project the current token — not reprocess the entire context.
+
+### Lifecycle
+
+| State | Trigger |
+|-------|---------|
+| Allocated | Model load (pre-allocated up to `max_context_length`, or grown dynamically) |
+| Prefilled | Prefill phase writes positions 0 through P−1 |
+| Growing | Each decode step appends one new position |
+| Disposed | Generation complete or model disposed |
+
+### Memory layout
+
+```
+Layer L, KV cache:
+┌──────────────────────────────────────────────────┐
+│ K_cache[L]: [max_seq_len × kv_heads × head_dim]  │  ← Written sequentially
+│ V_cache[L]: [max_seq_len × kv_heads × head_dim]  │  ← Read entirely each step
+└──────────────────────────────────────────────────┘
+```
+
+### Memory cost for Qwen 3.5 0.8B (FP16)
+
+- Per position per layer: 8 KV heads × 64 head_dim × 2 bytes × 2 (K+V) = **2 KB**
+- At 32K context, per standard attention layer: 2 KB × 32,768 = **64 MB**
+- With 6 standard attention layers (out of 24 total): **384 MB** at 32K context
+- KV cache quantization to Q8_0 reduces this by roughly half
+
+<Note>
+Qwen 3.5 0.8B uses a hybrid architecture: only 6 of its 24 layers are standard attention layers that require a KV cache. The remaining 18 are DeltaNet layers with a fixed-size recurrent state (~1 MB per layer regardless of context length). This makes 200K+ context feasible on 16 GB GPUs.
+</Note>
+
+## Sampling strategies
+
+After the forward pass produces a logit vector (one float per vocabulary token), sampling selects the next token using one or more of the following strategies, applied in order:
+
+```
+Raw logits → Repetition penalty → Temperature scaling → Top-k filter → Top-p filter → Softmax → Sample (or argmax)
+```
+
+### Parameter effects
+
+| Parameter | Range | Low value | High value |
+|-----------|-------|-----------|------------|
+| **Temperature** | 0.0–2.0 | Deterministic, repetitive | Creative, chaotic |
+| **Top-k** | 1–100 | Very focused (k=1 is greedy) | Wide candidate set |
+| **Top-p** | 0.0–1.0 | Narrow (few candidates) | Broad (many candidates) |
+| **Repetition penalty** | 1.0–2.0 | No effect | Strongly discourages repeats |
+
+**Repetition penalty** divides the logits of tokens that already appear in the context by the penalty value, making them less likely to be selected again.
+
+**Temperature** scales all logits before softmax: `logits / temperature`. Setting temperature to `0` selects the highest-probability token deterministically (argmax).
+
+**Top-k** zeros out all logits except the k highest, then renormalizes.
+
+**Top-p** (nucleus sampling) sorts tokens by probability descending, keeps the smallest set whose cumulative probability reaches p, and zeros the rest. The candidate set adapts to the shape of the distribution.

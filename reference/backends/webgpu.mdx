@@ -1,0 +1,267 @@
+---
+title: "WebGPU backend — browser and Node.js inference"
+description: "20+ WGSL compute shaders, DeltaNet GPU inference, HTTP model caching, Jinja2 chat templates, and benchmarks for the @daisinet/llogos-webgpu npm package."
+---
+
+The LLogos WebGPU backend (`@daisinet/llogos-webgpu`) runs GGUF model inference in any WebGPU-capable browser or Node.js environment, using 20+ WGSL compute shaders for GPU-accelerated text generation.
+
+## Installation
+
+```bash
+npm install @daisinet/llogos-webgpu
+```
+
+## Architecture
+
+The WebGPU backend is written in TypeScript and runs entirely in the browser or in Node.js via Dawn bindings. It has no dependency on the .NET backends.
+
+```
+Browser Tab / Node.js
+┌───────────────────────────────────────────┐
+│  LlogosEngine                             │
+│  ┌─────────────────────────────────────┐  │
+│  │ GGUF Parser → Tensor Loader → Model │  │
+│  │ BPE Tokenizer (from GGUF metadata)  │  │
+│  │ Sampler (temperature, top-k, top-p) │  │
+│  └─────────────────────────────────────┘  │
+│                    │                      │
+│  ┌─────────────────────────────────────┐  │
+│  │ ComputeEngine                       │  │
+│  │  BufferPool      ShaderCache        │  │
+│  │  (VRAM tracking) (pipeline cache)   │  │
+│  │  20+ WGSL compute shaders           │  │
+│  └─────────────────────────────────────┘  │
+│                    │                      │
+│           WebGPU API (navigator.gpu)      │
+└───────────────────────────────────────────┘
+                     │
+             GPU Hardware
+     (NVIDIA / AMD / Intel / Apple)
+```
+
+Four primary classes compose the engine:
+
+| Class | Responsibility |
+|-------|---------------|
+| `LlogosEngine` | Top-level API — GPU init, model loading, token generation, sampling |
+| `ComputeEngine` | Dispatches all GPU operations, manages shader pipelines and barriers |
+| `BufferPool` | Allocates and reuses GPU buffers, tracks VRAM usage |
+| `ShaderCache` | Caches compiled `GPUComputePipeline` objects to avoid redundant compilation |
+
+### Source layout
+
+| Directory | File | Purpose |
+|-----------|------|---------|
+| `src/` | `engine.ts` | Main `LlogosEngine` class |
+| `src/` | `index.ts` | Package exports |
+| `src/gguf/` | `gguf-parser.ts` | GGUF v2/v3 binary parser (header, metadata, tensor info) |
+| `src/gguf/` | `quantization.ts` | `GgmlType` enum, block sizes, type sizes |
+| `src/gpu/` | `compute.ts` | `ComputeEngine` — dispatches all GPU operations |
+| `src/gpu/` | `device.ts` | WebGPU adapter/device initialization, capability detection |
+| `src/gpu/` | `buffer-pool.ts` | GPU buffer allocation, reuse, VRAM tracking |
+| `src/gpu/` | `shader-cache.ts` | Compiled pipeline cache |
+| `src/model/` | `llama-model.ts` | Llama / Qwen2 forward pass (standard attention + GQA) |
+| `src/model/` | `qwen35-model.ts` | Qwen 3.5 hybrid forward pass (DeltaNet + gated attention) |
+| `src/model/` | `kv-cache.ts` | GPU-resident KV cache per layer |
+| `src/model/` | `sampler.ts` | Temperature, top-k, top-p, repetition penalty |
+| `src/tokenizer/` | `bpe-tokenizer.ts` | BPE tokenizer from GGUF metadata |
+| `src/tokenizer/` | `chat-template.ts` | Jinja2-style chat template interpreter |
+| `src/storage/` | `download-manager.ts` | HTTP streaming download with Cache API persistence |
+
+## WGSL compute shaders
+
+All GPU computation is expressed in WGSL (WebGPU Shading Language). Each shader is compiled to a `GPUComputePipeline` on first use and cached by `ShaderCache`.
+
+| Shader | Operation | Workgroup |
+|--------|-----------|-----------|
+| `matmul.wgsl` | F32 matrix-vector multiply | 256 threads, 2D dispatch for large M |
+| `matmul_q4.wgsl` | Fused Q4_0 dequant + matmul | 256 threads |
+| `matmul_q8.wgsl` | Native Q8_0 matmul (`unpack2x16float`) | 256 threads |
+| `attention.wgsl` | Multi-head attention with GQA | 64 threads per head |
+| `rmsnorm.wgsl` | RMS normalization | 256-thread reduction |
+| `rope.wgsl` | Rotary position embeddings | 1 thread per pair |
+| `embedding.wgsl` | Token embedding lookup | 256 threads |
+| `silu_mul.wgsl` | Fused SiLU gate × up (SwiGLU) | 256 threads |
+| `add.wgsl` | Element-wise add (residual connections) | 256 threads |
+| `add_bias.wgsl` | In-place bias addition | 256 threads |
+| `copy_rmsnorm.wgsl` | Fused copy + RMSNorm | 256 threads |
+| `softmax.wgsl` | Numerically stable softmax | 256 threads |
+| `conv1d_silu.wgsl` | Fused causal conv1d + SiLU with persistent state | 256 threads |
+| `l2_norm_groups.wgsl` | Per-group L2 normalization | 256-thread reduction per group |
+| `compute_decay_beta.wgsl` | Softplus + exp decay, sigmoid beta | 64 threads |
+| `deltanet_step.wgsl` | Full state update: mat-vec, rank-1 update, output, per-head RMSNorm | 128 threads per group |
+| `silu_gate.wgsl` | Element-wise SiLU gating | 256 threads |
+| `silu_inplace.wgsl` | In-place SiLU activation | 256 threads |
+
+The 6 DeltaNet-specific shaders (`conv1d_silu`, `l2_norm_groups`, `compute_decay_beta`, `deltanet_step`, `silu_gate`, `silu_inplace`) run entirely on GPU with zero CPU readbacks during inference.
+
+## Supported architectures
+
+| Architecture | Models | Features |
+|-------------|--------|----------|
+| Llama | TinyLlama 1.1B, Llama 3.2 1B | GQA, tied weights, 128K vocab |
+| Qwen 2/2.5 | Qwen 2.5 0.5B | Attention biases, ChatML |
+| Qwen 3.5 | Qwen 3.5 0.8B | **DeltaNet hybrid** (SSM + gated attention), 248K vocab |
+
+### Quantization support
+
+| Format | GPU native | CPU dequant |
+|--------|-----------|-------------|
+| F32 | Matmul | — |
+| Q8_0 | Matmul (`unpack2x16float`) | Dequant |
+| Q4_0 | Matmul (fused dequant) | Dequant |
+| Q4_1 | — | Dequant |
+| Q5_0 | — | Dequant |
+| Q5_1 | — | Dequant |
+| F16 | — | Dequant |
+| Q4_K | — | Dequant (partial) |
+| Q6_K | — | Dequant |
+
+## HTTP model loading and caching
+
+Models are loaded via HTTP `fetch` with streaming progress. Once downloaded, the raw GGUF bytes are stored in the browser's **Cache API** — subsequent page loads skip the network entirely and serve the model from the cache.
+
+```typescript
+// First load: downloads from URL and stores in Cache API
+await engine.loadModel('https://huggingface.co/.../model.gguf');
+
+// Subsequent loads: served from Cache API (no network request)
+await engine.loadModel('https://huggingface.co/.../model.gguf');
+```
+
+The `DownloadManager` class in `src/storage/download-manager.ts` handles both paths transparently.
+
+## Chat template engine
+
+The engine automatically detects and applies the correct chat template for each model:
+
+| Template | Detection | Format |
+|----------|-----------|--------|
+| **Llama 3** | `<\|start_header_id\|>` token in vocab | `<\|begin_of_text\|>` + role headers |
+| **ChatML** | `<\|im_start\|>` token in vocab | `<\|im_start\|>role\ncontent<\|im_end\|>` |
+| **Llama 2** | `[INST]` pattern in `tokenizer.chat_template` | Simple instruction wrapping |
+| **Jinja2** | Generic parser for `tokenizer.chat_template` | `{% for %}`, `{% if %}`, `{{ var }}`, filters |
+
+The Jinja2 parser reads the `tokenizer.chat_template` field from GGUF metadata and evaluates it directly — no server-side rendering required.
+
+## DAISI network integration
+
+The WebGPU engine integrates with the DAISI Manager as a **Browser Host**:
+
+- Loads models from HuggingFace via HTTP, persists in browser Cache API
+- Connects to the Orchestrator (ORC) directly via gRPC-web
+- Processes inference requests from the DAISI network
+- Streams tokens back in batches of 10 per response for efficient throughput
+- Auto-reconnects with exponential backoff on connection loss
+
+## TypeScript API
+
+```typescript
+import { LlogosEngine } from '@daisinet/llogos-webgpu';
+
+const engine = new LlogosEngine();
+
+// Initialize the WebGPU device
+await engine.initGpu();
+
+// Load a GGUF model (cached after first download)
+await engine.loadModel('https://huggingface.co/.../model.gguf');
+
+// Generate tokens as an async iterable
+for await (const token of engine.generate('Hello')) {
+  process.stdout.write(token);
+}
+```
+
+<Tabs>
+  <Tab title="Browser">
+    ```html
+    <script type="module">
+      import { LlogosEngine } from '@daisinet/llogos-webgpu';
+
+      const engine = new LlogosEngine();
+      await engine.initGpu();
+      await engine.loadModel('https://huggingface.co/.../model.gguf');
+
+      const output = document.getElementById('output');
+      for await (const token of engine.generate('Tell me a joke')) {
+        output.textContent += token;
+      }
+    </script>
+    ```
+  </Tab>
+  <Tab title="Node.js (Dawn)">
+    ```typescript
+    import { LlogosEngine } from '@daisinet/llogos-webgpu';
+
+    const engine = new LlogosEngine();
+    await engine.initGpu();
+    await engine.loadModel('https://huggingface.co/.../model.gguf');
+
+    for await (const token of engine.generate('Hello')) {
+      process.stdout.write(token);
+    }
+    ```
+  </Tab>
+</Tabs>
+
+## Browser and runtime requirements
+
+<Note>
+WebGPU is available in Chrome 113+, Edge 113+, and Safari 18+ (with the WebGPU feature flag). Firefox support is in progress behind a flag.
+</Note>
+
+| Environment | Requirement |
+|------------|-------------|
+| Chrome | 113+ |
+| Edge | 113+ |
+| Node.js | Via `webgpu` npm package (Dawn WebGPU bindings) |
+| Android | Tested (Adreno / Mali via WebGPU) |
+| iOS | Not yet supported |
+
+Node.js support uses the `webgpu` npm package, which bundles Google's Dawn native WebGPU implementation. This enables automated CI testing without a browser.
+
+## Testing
+
+```bash
+cd src/webgpu
+
+# Run all 72 tests (includes GPU inference via Dawn)
+npm test
+
+# Run benchmarks
+npx vitest run test/benchmark.test.ts
+
+# Build the package
+npm run build
+```
+
+Tests use the `webgpu` npm package for GPU compute in Node.js, enabling automated CI testing of actual GPU inference without a browser environment.
+
+## Benchmarks
+
+Measured via Dawn WebGPU (Node.js), NVIDIA RTX 5090 (Blackwell), 32 decode tokens.
+
+| Model | Prefill | Decode | VRAM |
+|-------|---------|--------|------|
+| TinyLlama 1.1B Q8_0 | 45 tok/s | — | 1570 MB |
+| Llama 3.2 1B Q8_0 | 61 tok/s | 54 tok/s | 2787 MB |
+| Qwen 2.5 0.5B Q8_0 | 42 tok/s | 37 tok/s | 1592 MB |
+| Qwen 3.5 0.8B Q8_0 | 17 tok/s | 17 tok/s | 1592 MB |
+
+Qwen 3.5 DeltaNet runs entirely on GPU — zero CPU readbacks during inference — via 6 custom WGSL shaders for the state-space computation.
+
+<CardGroup cols={2}>
+  <Card title="CUDA backend" icon="microchip" href="/reference/backends/cuda">
+    NVIDIA GPU inference with dp4a and fused kernels
+  </Card>
+  <Card title="Vulkan backend" icon="layer-group" href="/reference/backends/vulkan">
+    Cross-platform GPU inference on NVIDIA, AMD, and Intel
+  </Card>
+  <Card title="WebGPU quickstart" icon="browser" href="/quickstart-webgpu">
+    Get inference running in the browser in minutes
+  </Card>
+  <Card title="Tested models" icon="list-check" href="/reference/tested-models">
+    Verified GGUF models and recommended downloads
+  </Card>
+</CardGroup>

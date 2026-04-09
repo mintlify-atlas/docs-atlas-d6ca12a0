@@ -1,0 +1,199 @@
+---
+title: "Qwen 3.5 DeltaNet hybrid architecture"
+description: "Qwen 3.5 interleaves DeltaNet linear attention with standard gated attention. DeltaNet layers use O(1) fixed-size state instead of a growing KV cache."
+keywords: ["qwen3.5", "deltanet", "hybrid", "linear attention", "state space", "gguf", "long context"]
+---
+
+Qwen 3.5 uses a hybrid architecture combining standard gated attention layers with DeltaNet linear attention layers. LLogos implements the full DeltaNet forward pass including conv1d, state-space updates, and decay computation.
+
+## GGUF architecture identifier
+
+The `qwen35` architecture string identifies models in the Qwen 3.5 family. The layer schedule — which layers are DeltaNet and which are standard attention — is embedded in the GGUF metadata and read dynamically at load time.
+
+## Layer schedule
+
+In the 0.8B model (24 layers), every fourth layer is standard attention and the rest are DeltaNet:
+
+```
+Layer schedule (24-layer 0.8B example)
+========================================
+
+Layer:  0  1  2  3  4  5  6  7  8  9  10 11 ...
+Type:   D  D  D  A  D  D  D  A  D  D  D  A  ...
+
+D = DeltaNet (linear attention, O(1) memory)
+A = Standard gated attention (full attention, O(n) memory)
+
+Pattern: every 4th layer is standard attention
+(FullAttentionInterval = 4)
+```
+
+Across the Qwen 3.5 model sizes:
+
+| Model | Total layers | Standard attention layers | DeltaNet layers |
+|-------|-------------|--------------------------|-----------------|
+| Qwen3.5-0.8B | 24 | 6 | 18 |
+| Qwen3.5-4B | — | — | — |
+| Qwen3.5-9B | — | — | — |
+
+## Standard attention vs DeltaNet
+
+| Property | Standard attention | DeltaNet |
+|----------|--------------------|----------|
+| Per-token decode cost | O(context length) | O(1) |
+| Memory per layer | KV cache grows with context | Fixed-size state matrix |
+| Position encoding | RoPE | None needed — recurrent |
+| Causal masking | Explicit mask matrix | Inherent in recurrent update |
+| Quality | Best for precise retrieval | Better for smooth reasoning |
+
+### Why DeltaNet helps for long context
+
+Standard attention layers grow their KV cache linearly — at 32K context, each layer holds 64 MB of KV data. A DeltaNet layer replaces that with a fixed state matrix of roughly 1 MB regardless of context length:
+
+| Context length | Standard attention (FP16) per layer | DeltaNet per layer |
+|---------------|-------------------------------------|--------------------|
+| 1K tokens | 2 MB | 1 MB |
+| 8K tokens | 16 MB | 1 MB |
+| 32K tokens | 64 MB | 1 MB |
+
+In a 24-layer model where 18 layers are DeltaNet, only 6 layers accumulate KV cache. Total memory growth is reduced by 75% compared to a fully-standard model.
+
+## DeltaNet forward pass
+
+### Layer inputs
+
+DeltaNet layers share the same outer structure as standard attention layers — RMSNorm input, SwiGLU FFN, and residuals are identical. The attention block is replaced:
+
+```
+DeltaNet layer forward
+=======================
+
+Input (normOut)
+     |
+     v
+QKV projection ──> CausalConv1d ──> SiLU
+     |
+     v
+Split Q, K, V  (unequal: keyDim + keyDim + valueDim)
+     |
+     v
+L2NormGroups(Q, K) ──> RepeatTile  (GQA expansion)
+     |
+     v
+Alpha/Beta projections ──> ComputeDecayBeta
+     |
+     v
+DeltaNetStep  (recurrent state update + query)
+     |                    |
+     |              State matrix [heads × headDim × headDim]
+     |              (persistent across tokens, O(1) memory)
+     v
+Gate projection ──> SiLUGate
+     |
+     v
+Output projection ──> hidden
+```
+
+### The delta rule state update
+
+DeltaNet maintains a state matrix `S` of shape `[heads × headDim × headDim]` per layer. At each token position `t`:
+
+```
+β_t = sigmoid(W_β × x_t)              # gating scalar per head
+e_t = V_t - K_t^T × S_{t-1}           # error: V minus what S predicts
+S_t = S_{t-1} + β_t × (e_t^T × K_t)  # delta update to state
+o_t = Q_t × S_t                        # output: query against updated state
+```
+
+The state `S` acts as an associative memory mapping keys to values. The delta update is an online learning rule: it adjusts `S` to better predict `V` from `K`. The gate `β` controls how strongly each token writes to memory.
+
+<Note>
+The state update is **not backpropagated through during LoRA training** — the gradient stops at the residual connection. Backpropagating through the recurrent DeltaNetStep requires BPTT through matrix operations with decay and adds significant complexity with minimal benefit for knowledge injection workloads.
+</Note>
+
+### Additional weight tensors in DeltaNet layers
+
+DeltaNet layers carry one additional weight tensor compared to standard attention:
+
+| Standard attention | DeltaNet |
+|--------------------|----------|
+| `attn_q.weight` | `attn_q.weight` |
+| `attn_k.weight` | `attn_k.weight` |
+| `attn_v.weight` | `attn_v.weight` |
+| `attn_output.weight` | `attn_output.weight` |
+| — | `attn_beta.weight` (gate projection) |
+| `attn_norm.weight` | `attn_norm.weight` |
+
+## Implementation notes
+
+**Real DeltaNet forward for training.** An early approximation replaced the full DeltaNet recurrence with `silu(qkv) * silu(gate)` element-wise. This produced a training loss of 23 — completely wrong. The correct hidden states require the actual recurrent kernels (CausalConv1d, DeltaNetStep, ComputeDecayBeta). LLogos now runs the real forward pass during training, which converges normally.
+
+**F32 weight dequant for training.** During LoRA training, weights are cached as F32 to avoid Q8_0 dp4a alignment bugs and BatchMatMul dequant issues. No additional memory is consumed because the backward pass already requires F32 activations.
+
+**Token-by-token DeltaNet in training.** Training processes DeltaNet layers one token at a time (to maintain exact recurrent state), while batching attention and FFN layers for efficiency. This matches inference behavior exactly.
+
+**Layer dispatch.** At runtime, LLogos reads each layer's type from the GGUF metadata and dispatches to either the standard gated attention path or the DeltaNet path. The FFN, RMSNorm, and residual connections use the same code for both layer types.
+
+## Supported quantization formats
+
+Q8_0, Q4_0, Q4_K_M, BF16, F16, F32
+
+## Supported models
+
+| Model | Parameters | Tested quants | LoRA training |
+|-------|-----------|---------------|---------------|
+| Qwen3.5-0.8B | 0.8B | Q8_0, BF16 | Yes — 4.3 seq/s, loss → 0.001 |
+| Qwen3.5-4B | 4B | Q8_0 | Untested |
+| Qwen3.5-9B | 9B | Q8_0, Q4_0, Q4_K_M | Untested |
+
+## Benchmarks
+
+Measured on AMD Ryzen 9 9900X + NVIDIA RTX 5080, 128 decode tokens, FP16 KV cache. Compared against llama.cpp b8461.
+
+| Model | Quant | LLogos CUDA (tok/s) | llama.cpp CUDA (tok/s) | vs llama.cpp |
+|-------|-------|--------------------:|----------------------:|:------------:|
+| Qwen3.5-0.8B | Q8_0 | **441** | 399 | **110%** |
+| Qwen3.5-4B | Q8_0 | **144** | 135 | **107%** |
+| Qwen3.5-9B | Q8_0 | **88** | 84 | **105%** |
+| Qwen3.5-9B | Q4_0 | 101 | 123 | 82% |
+
+### Vulkan
+
+| Model | Quant | LLogos Vulkan (tok/s) |
+|-------|-------|----------------------:|
+| Qwen3.5-0.8B | Q8_0 | 156 |
+| Qwen3.5-4B | Q8_0 | 73 |
+| Qwen3.5-9B | Q8_0 | 53 |
+
+### WebGPU
+
+Measured via Dawn WebGPU (Node.js), NVIDIA RTX 5090, 32 decode tokens. DeltaNet runs entirely on GPU — 6 custom WGSL shaders with zero CPU readbacks.
+
+| Model | Prefill (tok/s) | Decode (tok/s) | VRAM |
+|-------|----------------:|---------------:|-----:|
+| Qwen3.5-0.8B Q8_0 | 17 | 17 | 1592 MB |
+
+<Tip>
+Qwen3.5-0.8B Q8_0 is the recommended test model for LLogos. It is the smallest model that exercises all DeltaNet code paths and is used as the primary CI target. Download it from Hugging Face as `unsloth/Qwen3.5-0.8B-GGUF` and place it at `C:\GGUFS\Qwen3.5-0.8B-Q8_0.gguf`.
+</Tip>
+
+## Known quirks and limitations
+
+- **Q4_0 regression at 9B.** Qwen3.5-9B Q4_0 runs at 82% of llama.cpp speed. Q8_0 and Q4_K_M are recommended for this model size.
+- **Approximate DeltaNet is wrong.** If you implement a custom backend, do not approximate DeltaNet with element-wise gating. The recurrent state update is essential for correct hidden states.
+- **LoRA training not tested on 4B/9B.** Only Qwen3.5-0.8B LoRA training has been fully validated. Larger models are expected to work but have not been run to convergence.
+
+<CardGroup cols={2}>
+  <Card title="Qwen 3 architecture" icon="layer-group" href="/reference/architectures/qwen3">
+    Pure standard attention — gated Q and per-head norms, no DeltaNet
+  </Card>
+  <Card title="LoRA training guide" icon="graduation-cap" href="/guides/lora-training">
+    Fine-tune Qwen 3.5 models directly on GGUF weights
+  </Card>
+  <Card title="Long context guide" icon="scroll" href="/guides/long-context">
+    Flash attention, paged KV cache, and attention sinks for streaming
+  </Card>
+  <Card title="CUDA backend" icon="microchip" href="/reference/backends/cuda">
+    DeltaNetStep, CausalConv1d, and ComputeDecayBeta kernel details
+  </Card>
+</CardGroup>

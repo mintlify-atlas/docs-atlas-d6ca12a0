@@ -1,0 +1,166 @@
+---
+title: "Verified GGUF models and performance benchmarks"
+description: "GGUF models verified with LLogos across CPU, CUDA, and Vulkan backends, with decode throughput benchmarks and supported quantization formats."
+---
+
+LLogos has been tested and benchmarked against these GGUF model files. Performance figures are measured on AMD Ryzen 9 9900X + NVIDIA RTX 5080 with FP16 KV cache.
+
+## Fully working models
+
+These models produce correct, coherent output on all available backends.
+
+| Model | Architecture | Params | Quantization | Backends | Download |
+|-------|-------------|--------|-------------|----------|----------|
+| [Qwen3-8B](https://huggingface.co/unsloth/Qwen3-8B-GGUF) | qwen3 | 8B | Q8\_0, Q4\_K\_M | CPU, CUDA, Vulkan | [Q8\_0](https://huggingface.co/unsloth/Qwen3-8B-GGUF/resolve/main/Qwen3-8B-Q8_0.gguf) (8.7 GB), [Q4\_K\_M](https://huggingface.co/unsloth/Qwen3-8B-GGUF/resolve/main/Qwen3-8B-Q4_K_M.gguf) (5.0 GB) |
+| [DeepSeek R1 Distill Llama 8B](https://huggingface.co/unsloth/DeepSeek-R1-Distill-Llama-8B-GGUF) | llama | 8B | Q8\_0 | CPU, CUDA, Vulkan | [Q8\_0](https://huggingface.co/unsloth/DeepSeek-R1-Distill-Llama-8B-GGUF/resolve/main/DeepSeek-R1-Distill-Llama-8B-Q8_0.gguf) (8.5 GB) |
+| [Qwen3.5-0.8B](https://huggingface.co/unsloth/Qwen3.5-0.8B-GGUF) | qwen35 (hybrid DeltaNet) | 0.8B | Q8\_0 | CPU, CUDA, Vulkan | [Q8\_0](https://huggingface.co/unsloth/Qwen3.5-0.8B-GGUF/resolve/main/Qwen3.5-0.8B-Q8_0.gguf) (812 MB) |
+| [Qwen3.5-4B](https://huggingface.co/unsloth/Qwen3.5-4B-GGUF) | qwen35 (hybrid DeltaNet) | 4B | Q8\_0 | CPU, CUDA, Vulkan | [Q8\_0](https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/main/Qwen3.5-4B-Q8_0.gguf) (4.2 GB) |
+| [Qwen3.5-9B](https://huggingface.co/unsloth/Qwen3.5-9B-GGUF) | qwen35 (hybrid DeltaNet) | 9B | Q8\_0, Q4\_0, Q4\_K\_M | CPU, CUDA, Vulkan | [Q8\_0](https://huggingface.co/unsloth/Qwen3.5-9B-GGUF/resolve/main/Qwen3.5-9B-Q8_0.gguf) (9.8 GB), [Q4\_0](https://huggingface.co/unsloth/Qwen3.5-9B-GGUF/resolve/main/Qwen3.5-9B-Q4_0.gguf) (5.1 GB) |
+| [TinyLlama 1.1B Chat v1.0](https://huggingface.co/TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF) | llama | 1.1B | Q8\_0 | CPU, CUDA, Vulkan | [Q8\_0](https://huggingface.co/TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF/resolve/main/tinyllama-1.1b-chat-v1.0.Q8_0.gguf) (1.1 GB) |
+| [BitNet b1.58](https://huggingface.co/1bitLLM/bitnet_b1_58-large) | bitnet-b1.58 | 0.7B | I2\_S (ternary) | CPU, CUDA | Custom build (1.2 GB) |
+| [Bonsai-8B](https://huggingface.co/prism-ml/Bonsai-8B-gguf) | qwen3 (1-bit) | 8B | Q1\_0\_g128 | CPU, CUDA | [Q1\_0\_g128](https://huggingface.co/prism-ml/Bonsai-8B-gguf/resolve/main/Bonsai-8B.gguf) (1.1 GB) |
+| [Qwen2.5-0.5B](https://huggingface.co/Qwen/Qwen2.5-0.5B-GGUF) | qwen2 | 0.5B | Q8\_0 | CPU, CUDA | [Q8\_0](https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF) (0.5 GB) |
+| [Llama 3.2-1B](https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF) | llama | 1B | Q8\_0 | CPU, CUDA | [Q8\_0](https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF) (1.3 GB) |
+
+<Note>
+  **Test model for development:** [Qwen3.5-0.8B Q8\_0](https://huggingface.co/unsloth/Qwen3.5-0.8B-GGUF) — download to `C:\GGUFS\Qwen3.5-0.8B-Q8_0.gguf`. All 251+ unit tests use this model and skip gracefully if the file is not present.
+</Note>
+
+---
+
+## Performance benchmarks
+
+Measured with `--bench`, 128 decode tokens, FP16 KV cache. Compared against llama.cpp b8461.
+
+### LLogos CUDA vs llama.cpp CUDA
+
+**LLogos exceeds llama.cpp on 4 of 8 models across three architectures (DeltaNet, LLaMA, and standard attention).**
+
+| Model | LLogos CUDA (tok/s) | llama.cpp CUDA (tok/s) | % of llama.cpp |
+|-------|--------:|--------:|--------:|
+| Qwen3.5-0.8B Q8\_0 | **441** | 399 | **110%** |
+| TinyLlama 1.1B Q8\_0 | **448** | 443 | **101%** |
+| Qwen3.5-4B Q8\_0 | **144** | 135 | **107%** |
+| Qwen3-8B Q8\_0 | 91 | 92 | 99% |
+| DeepSeek R1 8B Q8\_0 | 94 | 95 | 99% |
+| Qwen3-8B Q4\_K\_M | 124 | 138 | 90% |
+| Qwen3.5-9B Q8\_0 | **88** | 84 | **105%** |
+| Qwen3.5-9B Q4\_0 | 101 | 123 | 82% |
+
+### LLogos Vulkan vs llama.cpp Vulkan
+
+| Model | llama.cpp Vulkan (tok/s) | LLogos Vulkan (tok/s) | % of llama.cpp |
+|-------|--------:|--------:|--------:|
+| Qwen3.5-0.8B Q8\_0 | 466 | 156 | 33% |
+| Qwen3-8B Q8\_0 | 96 | 56 | 58% |
+| Qwen3-8B Q4\_K\_M | 142 | 54 | 38% |
+| Qwen3.5-9B Q8\_0 | — | 53 | — |
+| Qwen3.5-9B Q4\_0 | — | 45 | — |
+
+<Note>
+  llama.cpp Vulkan b8461 has a regression on Qwen3.5 DeltaNet models (~11 tok/s). LLogos Vulkan handles DeltaNet correctly and is the only working Vulkan path for those models.
+</Note>
+
+### All LLogos backends
+
+| Model | CUDA (tok/s) | Vulkan (tok/s) | CPU (tok/s) |
+|-------|-----:|-------:|----:|
+| Qwen3.5-0.8B Q8\_0 | 441 | 156 | 22 |
+| TinyLlama 1.1B Q8\_0 | 448 | — | 13 |
+| Qwen3.5-4B Q8\_0 | 144 | 73 | — |
+| Qwen3-8B Q8\_0 | 91 | 56 | — |
+| DeepSeek R1 8B Q8\_0 | 94 | — | — |
+| Qwen3-8B Q4\_K\_M | 124 | 54 | — |
+| Qwen3.5-9B Q8\_0 | 88 | 53 | — |
+| Qwen3.5-9B Q4\_0 | 101 | 45 | — |
+
+---
+
+## WebGPU benchmarks
+
+Measured via Dawn WebGPU (Node.js), NVIDIA RTX 5090 (Blackwell), 32 decode tokens.
+
+| Model | Prefill (tok/s) | Decode (tok/s) | VRAM |
+|-------|---------|--------|------|
+| TinyLlama 1.1B Q8\_0 | 45 | — | 1,570 MB |
+| Llama 3.2 1B Q8\_0 | 61 | 54 | 2,787 MB |
+| Qwen 2.5 0.5B Q8\_0 | 42 | 37 | 1,592 MB |
+| Qwen 3.5 0.8B Q8\_0 | 17 | 17 | 1,592 MB |
+
+DeltaNet (Qwen 3.5) runs entirely on GPU with zero CPU readbacks via 6 custom WGSL shaders for the state-space computation.
+
+---
+
+## Supported quantization formats
+
+### Native GPU kernels (CUDA + Vulkan)
+
+These formats have dedicated fused dequant+matmul GPU kernels for maximum performance:
+
+| Format | MatMul | Embedding Lookup | Notes |
+|--------|--------|-----------------|-------|
+| F32 | GPU (cuBLAS / uint32) | GPU | Full precision |
+| F16 | GPU (uint32 pairs) | GPU | Half precision |
+| Q8\_0 | GPU (aligned uint32) | GPU | 8-bit — recommended |
+| Q4\_0 | GPU (dp4a / float) | GPU | 4-bit with dp4a on pre-Blackwell |
+| Q4\_1 | GPU (uint32) | GPU | 4-bit with min offset |
+| Q4\_K | GPU (uint32) | GPU | 4-bit K-quant |
+| Q5\_K | GPU | GPU | 5-bit K-quant |
+| Q6\_K | GPU | — | 6-bit K-quant |
+| BF16 | GPU (cuBLAS) | GPU | Brain floating point |
+| Q1\_0 | GPU (FMA) | GPU | 1-bit binary sign, 32 elem/block |
+| Q1\_0\_g128 | GPU (FMA) | GPU | 1-bit binary sign, 128 elem/block (Bonsai) |
+| I2\_S | GPU | — | BitNet ternary weights |
+| TQ1\_0 | GPU | — | Ternary base-3 |
+
+### Generic fallback (CPU dequantization)
+
+Any format with dequantization support works via automatic CPU fallback. Functional but slower than native GPU kernels.
+
+| Format | Dequant | Notes |
+|--------|---------|-------|
+| Q5\_0 | Yes | 5-bit |
+| Q5\_1 | Yes | 5-bit with min |
+| Q2\_K | Yes | 2-bit K-quant |
+| Q3\_K | Yes | 3-bit K-quant |
+| BF16 | Yes | Brain float16 |
+
+---
+
+## Recommended models
+
+| Use case | Model | Size | CUDA (tok/s) | Notes |
+|----------|-------|------|-------------|-------|
+| Best quality | [Qwen3-8B Q8\_0](https://huggingface.co/unsloth/Qwen3-8B-GGUF) | 8.7 GB | 91 | 99% of llama.cpp |
+| Best speed | [Qwen3.5-0.8B Q8\_0](https://huggingface.co/unsloth/Qwen3.5-0.8B-GGUF) | 812 MB | 441 | **110% of llama.cpp** |
+| Best value | [Qwen3-8B Q4\_K\_M](https://huggingface.co/unsloth/Qwen3-8B-GGUF) | 5.0 GB | 124 | Good quality at half the VRAM |
+| DeltaNet hybrid | [Qwen3.5-9B Q8\_0](https://huggingface.co/unsloth/Qwen3.5-9B-GGUF) | 9.8 GB | 88 | **105% of llama.cpp** |
+| Smallest 4-bit | [Qwen3.5-9B Q4\_0](https://huggingface.co/unsloth/Qwen3.5-9B-GGUF) | 5.1 GB | 101 | Compact footprint |
+| Reasoning | [DeepSeek R1 8B Q8\_0](https://huggingface.co/unsloth/DeepSeek-R1-Distill-Llama-8B-GGUF) | 8.5 GB | 94 | Chain-of-thought capable |
+
+---
+
+## CUDA optimizations
+
+Key techniques applied to achieve competitive CUDA throughput:
+
+- **Partial vocab logit computation** — lm\_head computes only VocabSize/32 tokens (~4,752 of 152K), +10% speedup with identical greedy output
+- **dp4a integer dot product** — `__dp4a` for Q4\_0 with fused RmsNorm+Q8\_1 quantization (zero-overhead activation prep)
+- **Architecture-adaptive dispatch** — Blackwell (SM 12.x) uses float path, pre-Blackwell uses dp4a for 4-bit quants
+- **Per-quant row count tuning** — Q8\_0=2, Q4\_K=3, Q6\_K=10, Q4\_0=2, Q4\_1=8, Q5\_K=1
+- **CUDA graph capture** — single `cuGraphLaunch` replaces ~435 individual kernel launches per token
+- **Aligned block repacking** — Q8\_0 34→36, Q4\_0 18→20 bytes for native uint32 loads
+- **Fused RmsNorm+Q8\_1** — 3 fused kernels prepare Q8\_1 data inside the normalization pass
+- **Multi-row activation reuse** — load activation once, multiply against 2–10 weight rows
+- **GPU-side argmax** — download 4 bytes instead of 600 KB per token
+- **Fused layer boundaries** — AddRmsNormResidual, SwiGLU, AddRmsNorm
+
+## Vulkan optimizations
+
+- **Q4\_0/Q4\_1/Q5\_K matmul + embedding shaders** — full 4-bit GPU support
+- **uint32 buffer view** — native 4-byte coalesced reads via `uint weight_u32[]` binding
+- **Aligned Q8\_0 repacking** — 34→36 bytes for uint32-aligned quant reads
+- **Multi-row workgroups** — per-quant tuning matching CUDA row counts
+- **Subgroup arithmetic reduction** — `subgroupAdd` replaces shared memory reduction
+- **Fused composite ops** — RmsNormResidual, AddRmsNorm, SplitSwiGLU, RepeatTile, ArgMax
+- **Vulkan 1.2** with int8/fp16 features, SPIR-V 1.3

@@ -1,0 +1,171 @@
+---
+title: "LLogos known issues and investigation notes"
+description: "Resolved bugs, remaining performance gaps, and investigation notes for LLogos — covering quantization accuracy and architecture-specific edge cases."
+---
+
+This page tracks known issues and investigation notes for LLogos, including quantization accuracy limitations and architecture-specific edge cases.
+
+All original bugs (issues 1–5) are **fixed**. The remaining sections document resolved issues for reference and ongoing performance optimization gaps.
+
+---
+
+## Resolved bugs
+
+<Accordion title="K-quant dequantization (Q6_K, Q5_K, Q3_K) — Fixed">
+  **Issue:** Incorrect dequantization of K-quant formats due to wrong scale handling in Q6\_K, nibble/bit layout errors in Q5\_K, and an incorrect type size calculation for Q3\_K.
+
+  **Status:** Fixed. All K-quant formats (Q2\_K through Q6\_K) now produce correct output on CPU, CUDA, and Vulkan.
+</Accordion>
+
+<Accordion title="Qwen3.5-9B conv buffer overflow — Fixed">
+  **Issue:** CausalConv1d buffer overflow specific to the 9B model's larger hidden dimensions.
+
+  **Status:** Fixed. Buffer sizing now accounts for the full hidden dimension range of all Qwen3.5 model sizes.
+</Accordion>
+
+<Accordion title="Qwen3 HasGatedQ detection — Fixed">
+  **Issue:** The `HasGatedQ` flag for Qwen3 architecture (gated Q projection / DeInterleaveQ) was not being detected correctly, causing incorrect attention computation.
+
+  **Status:** Fixed. Architecture detection now correctly identifies Qwen3-family gated Q behavior.
+</Accordion>
+
+<Accordion title="CausalConv1d buffer overflow (DeltaNet) — Fixed">
+  **Issue:** Overflow in the DeltaNet CausalConv1d temporary buffer allocation.
+
+  **Status:** Fixed. Buffer lifetime and size are now managed per-operation.
+</Accordion>
+
+<Accordion title="Qwen3.5-9B Q/K head expansion: repeat vs repeat_interleave — Fixed">
+  **Issue:** GQA head expansion used `repeat` (tile blocks) instead of `repeat_interleave` (interleave elements), producing wrong attention patterns on Qwen3.5-9B.
+
+  **Status:** Fixed. Head expansion now uses `repeat_interleave`, matching the reference implementation.
+</Accordion>
+
+<Accordion title="Vulkan DeltaNet batching crash — Fixed">
+  **Issue:** Crash during batched Vulkan DeltaNet inference caused by two root causes: incorrect CausalConv1d temporary buffer lifetime (freed before GPU completion), and CopyBuffer commands not being recorded into the batch command buffer.
+
+  **Status:** Fixed. Buffer lifetime extended to span the full batch, and CopyBuffer is now recorded correctly.
+</Accordion>
+
+<Accordion title="Vulkan SplitSwiGLU CPU fallback — Fixed">
+  **Issue:** The SplitSwiGLU operation was falling back to CPU, causing GPU↔CPU round-trips per layer and dramatically slowing Vulkan inference.
+
+  **Status:** Fixed. SplitSwiGLU is now a GPU composite op with a dedicated SPIR-V kernel.
+</Accordion>
+
+<Accordion title="Vulkan SplitUnequalQKV CPU fallback — Fixed">
+  **Issue:** SplitUnequalQKV fell back to CPU due to missing `srcOffset` support in the Vulkan CopyTensorRegion path.
+
+  **Status:** Fixed. GPU CopyTensorRegion now correctly handles non-zero source offsets.
+</Accordion>
+
+<Accordion title="Vulkan RepeatTile CPU fallback — Fixed">
+  **Issue:** RepeatTile (used for GQA key/value head expansion) had no Vulkan implementation and fell back to CPU.
+
+  **Status:** Fixed. RepeatTile is now a GPU compute shader.
+</Accordion>
+
+<Accordion title="Vulkan CopyTensorRegion ignoring srcOffset — Fixed">
+  **Issue:** CopyTensorRegion was always copying from offset 0, ignoring the requested `srcOffset` parameter. This silently produced wrong data for any copy not starting at the tensor beginning.
+
+  **Status:** Fixed. The srcOffset is now correctly applied in the Vulkan copy dispatch.
+</Accordion>
+
+<Accordion title="Vulkan ArgMax CPU fallback — Fixed">
+  **Issue:** ArgMax (token selection from logits) fell back to CPU, requiring download of the full 600 KB logit tensor (152K tokens × float) every decode step.
+
+  **Status:** Fixed. ArgMax is now a GPU composite op that downloads only 4 bytes per token.
+</Accordion>
+
+<Accordion title="SwiGLU Q8_1 scratch overflow on batched prefill — Fixed">
+  **Issue:** The fused SwiGLU+Q8\_1 kernel wrote M×N elements to a single-token-sized scratch buffer when batch size M > 1, corrupting adjacent memory during batched prefill.
+
+  **Status:** Fixed. Scratch buffer is now sized for the full batch.
+</Accordion>
+
+<Accordion title="Training arena corruption at seqLen > 208 — Fixed">
+  **Issue:** The memory arena allocator used during training caused data corruption when sequence length exceeded 208 tokens, due to incorrect arena boundary tracking.
+
+  **Status:** Fixed. The arena allocator is disabled for training; all tensors use per-tensor pool allocation.
+</Accordion>
+
+<Accordion title="Non-power-of-2 attention reduction in training — Fixed">
+  **Issue:** Training attention backward kernels rounded thread counts to the nearest power of 2, but did not correctly handle sequence lengths that were not powers of 2, producing incorrect gradients.
+
+  **Status:** Fixed. Thread count rounding now handles arbitrary sequence lengths.
+</Accordion>
+
+<Accordion title="Duplicate embedding loop in ForwardBatchedPrefill — Fixed">
+  **Issue:** The batched prefill path applied the embedding lookup twice, doubling embedding values and producing garbled output on the first forward pass.
+
+  **Status:** Fixed. Embedding lookup is now applied exactly once per batch.
+</Accordion>
+
+---
+
+## Resolved: dp4a precision loss (stale Q8\_1 cache)
+
+<Accordion title="dp4a garbage output — Fixed">
+  ### Symptom
+  The `__dp4a` integer dot product path (CUDA Q4\_0 matmul) produced garbage output. Initially suspected to be precision loss from int8 activation quantization compounding across layers.
+
+  ### Root cause
+  **Stale Q8\_1 cache.** The Q8\_1 quantized activation was cached by device pointer address. However, the same tensor (`_normOut`) is reused across layers — same pointer, different data. The cache served stale Q8\_1 data from the previous layer, so every matmul after the first ran on wrong activations.
+
+  A secondary bug was also present: the on-demand quantization condition included `!_q8_1FusedReady`, which prevented re-quantization when the activation changed for o\_proj and down\_proj matmuls, causing the dp4a kernel to run on stale data. This was latent and masked by the Blackwell float fallback path for Q4\_0.
+
+  ### Fix
+  1. **Generation-based cache invalidation:** a counter is incremented by every operation that writes to a tensor (RmsNorm, AddRmsNorm, etc.). The cache checks both pointer AND generation counter.
+  2. **Three fused RmsNorm+Q8\_1 kernels** pre-compute Q8\_1 data inside the normalization pass, eliminating the separate quantization step entirely.
+  3. **Removed `!_q8_1FusedReady` guard:** always re-quantize when the activation pointer or generation changes.
+
+  **Status:** Fixed. dp4a is now the default Q4\_0 path on all pre-Blackwell GPUs. Q4\_K also has a cooperative dp4a kernel (v2) with 128 threads and 16 threads per super-block, alongside a fused MatMulSwiGLU kernel for Q4\_K FFN layers.
+</Accordion>
+
+---
+
+## Remaining performance gaps
+
+<Accordion title="CUDA Q4_K_M — 90% of llama.cpp">
+  **Current standing:** LLogos CUDA achieves ~90% of llama.cpp on Qwen3-8B Q4\_K\_M (124 vs 138 tok/s).
+
+  **Progress:** Closed from the original ~80% gap via fused SwiGLU matmul, Q6\_K kernel optimization (10→3 rows), and cooperative dp4a kernels.
+
+  **Remaining gap:** ~8–10% attributed to mixed-quant layer pipeline overhead and Q4\_K super-block arithmetic efficiency. The fused MatMulSwiGLU kernel handles gate+up projection + SiLU in a single pass for FFN layers, and cooperative dp4a uses 128 threads with 16 threads per super-block.
+
+  **Status:** Under investigation. No correctness issues.
+</Accordion>
+
+<Accordion title="CUDA Q4_0 on Qwen3.5 — 82% of llama.cpp">
+  **Current standing:** LLogos CUDA achieves ~82% of llama.cpp on Qwen3.5-9B Q4\_0 (101 vs 123 tok/s).
+
+  **Root cause:** The Qwen3.5 hybrid DeltaNet architecture includes a non-trivial per-layer DeltaNet recurrent state update step. This overhead is proportionally larger relative to the Q4\_0 matmul cost, and llama.cpp does not implement DeltaNet — it runs a degraded attention-only path that is faster but produces different (lower quality) output.
+
+  For pure attention Q4\_0 models (LLaMA family), the gap would be significantly smaller.
+
+  **Status:** Architectural limitation. No fix planned; the throughput difference reflects the cost of correct DeltaNet computation.
+</Accordion>
+
+<Accordion title="Vulkan throughput — 33–58% of llama.cpp">
+  **Current standing:** LLogos Vulkan achieves 33–58% of llama.cpp Vulkan on tested models.
+
+  **Root cause:** Vulkan GLSL does not have a `dp4a` equivalent (no integer dot product intrinsic in standard GLSL), so 4-bit quantized matmul relies on float unpacking rather than integer arithmetic. This limits bandwidth utilization compared to CUDA's `__dp4a`.
+
+  Additionally, the Vulkan backend does not yet implement CUDA graph-equivalent batching — each kernel launch has higher driver overhead than the CUDA path.
+
+  **Note:** llama.cpp Vulkan b8461 has a regression on Qwen3.5 DeltaNet models (~11 tok/s vs LLogos Vulkan's 53 tok/s). For DeltaNet models, LLogos Vulkan is currently the only correct Vulkan implementation.
+
+  **Status:** Ongoing. Further shader optimization and potential `VK_KHR_shader_integer_dot_product` integration are planned.
+</Accordion>
+
+---
+
+## Architecture reference: Qwen3.5-9B DeltaNet
+
+The Qwen3.5 architecture is a hybrid of standard gated attention layers and DeltaNet linear attention layers. See [Architecture: Qwen 3.5](/reference/architectures/qwen35) for tensor mapping, layer schedule, and implementation details.
+
+Key properties:
+- Each layer alternates between standard gated attention and DeltaNet
+- DeltaNet layers maintain a persistent recurrent state matrix (20 KB per layer boundary)
+- CausalConv1d is applied to K and V projections inside each DeltaNet block
+- Training targets for DeltaNet projections use the `d` letter in `--targets` (e.g. `--targets qkvod`)

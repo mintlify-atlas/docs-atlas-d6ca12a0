@@ -1,0 +1,110 @@
+---
+title: "LLaMA architecture support in LLogos"
+description: "Baseline transformer used by TinyLlama, Llama 3, and DeepSeek R1. Standard GQA, SwiGLU feed-forward, RoPE, and no attention biases or gating."
+keywords: ["llama", "gguf", "architecture", "gqa", "swiglu", "rope", "tinyllama", "deepseek"]
+---
+
+LLogos implements the LLaMA family transformer architecture, which serves as the baseline for most open-weight models. It uses standard multi-head attention with Grouped Query Attention (GQA), SwiGLU feed-forward networks, and RoPE positional encodings.
+
+## GGUF architecture identifier
+
+The `llama` architecture string is set in the GGUF metadata under the `general.architecture` key. LLogos reads this key at load time and routes the model through the standard LLaMA forward pass.
+
+## Layer structure
+
+Each transformer layer follows the same pattern:
+
+```
+Standard LLaMA layer
+=====================
+
+hidden ──> RMSNorm ──> Q/K/V projections
+                            |
+                            v
+                       RoPE(Q, K)
+                            |
+                            v
+                       KV cache write
+                            |
+                            v
+                   Causal attention (GQA)
+                            |
+                            v
+                    O projection + residual
+                            |
+                            v
+                  RMSNorm ──> FFN (SwiGLU)
+                            |
+                            v
+                       + residual ──> next layer
+```
+
+<Note>
+LLaMA has **no attention biases** on Q/K/V projections (unlike Qwen 2/2.5), and **no gated Q projection** or per-head norms (unlike Qwen 3+). It is the simplest of the supported architectures.
+</Note>
+
+## Key features
+
+| Feature | Details |
+|---------|---------|
+| Grouped Query Attention | Llama 3: 32 query heads / 8 KV heads. TinyLlama: 32 / 4 |
+| RoPE | Rotary Position Embeddings applied to Q and K after projection |
+| SwiGLU | Fused gate + up FFN with SiLU activation |
+| No biases | No attention biases on Q, K, or V projections |
+| No gated Q | Standard Q projection — single output, no deinterleave step |
+
+## Implementation notes
+
+**Fused SwiGLU kernel.** LLogos merges the gate and up MatMul with the SiLU activation into a single CUDA kernel for Q4_K weights. This eliminates an intermediate buffer and reduces memory bandwidth pressure.
+
+**dp4a integer matmul.** Q8_0 and Q4_0 weights use the `__dp4a` INT8 dot product instruction on CUDA. LLogos matches llama.cpp precision on all tested LLaMA models.
+
+**Aligned Q8_0 repacking.** Q8_0 blocks are stored as 34 bytes in GGUF but require 36-byte alignment for correct `dp4a` reads. LLogos repacks all Q8_0 blocks at load time regardless of the hidden dimension size. An earlier version only repacked weights with `K >= 2048`, which caused NaN outputs for small models.
+
+**TinyLlama as CI baseline.** TinyLlama 1.1B is small enough to run in CI and exercises every code path including LoRA training (verified with perfect recall on training data).
+
+## Supported quantization formats
+
+Q8_0, Q4_0, Q4_1, Q4_K_M, Q5_K_M, Q6_K, F16, BF16, F32
+
+## Supported models
+
+| Model | Parameters | Tested quants | LoRA training |
+|-------|-----------|---------------|---------------|
+| TinyLlama 1.1B | 1.1B | Q8_0, Q4_0 | Yes — perfect recall verified |
+| Llama 3.2-1B | 1B | Q8_0 | Untested |
+| DeepSeek R1 Distill 8B | 8B | Q8_0 | Untested |
+
+## Benchmarks
+
+Measured on AMD Ryzen 9 9900X + NVIDIA RTX 5080, 128 decode tokens, FP16 KV cache. Compared against llama.cpp b8461.
+
+| Model | Quant | LLogos CUDA (tok/s) | llama.cpp CUDA (tok/s) | vs llama.cpp |
+|-------|-------|--------------------:|----------------------:|:------------:|
+| TinyLlama 1.1B | Q8_0 | 448 | 443 | **101%** |
+| Llama 3.2-1B | Q8_0 | ~300 | — | — |
+| DeepSeek R1 8B | Q8_0 | 94 | 95 | 99% |
+
+<Tip>
+TinyLlama 1.1B Q8_0 is the recommended model for validating a new LLogos build. It fits in 1.5 GB of VRAM, runs in under 10 seconds on any CUDA GPU, and exercises all LLaMA code paths.
+</Tip>
+
+## Known quirks and limitations
+
+- **Q8_0 NaN on small models (fixed):** Models with hidden dimension below 2048 were not getting Q8_0 block repacking in early builds. The threshold has been removed; all Q8_0 weights are repacked unconditionally.
+- **LoRA training on Llama 3.2-1B and DeepSeek R1 8B:** Not yet tested. TinyLlama is the only verified LoRA target in the LLaMA family.
+
+<CardGroup cols={2}>
+  <Card title="Qwen 2/2.5 architecture" icon="layer-group" href="/reference/architectures/qwen2">
+    Extends LLaMA with learned attention biases on Q, K, and V projections
+  </Card>
+  <Card title="Qwen 3 architecture" icon="layer-group" href="/reference/architectures/qwen3">
+    Gated Q projection, per-head Q/K norms, and Bonsai 1-bit quantization
+  </Card>
+  <Card title="CUDA backend" icon="microchip" href="/reference/backends/cuda">
+    dp4a kernels, fused SwiGLU, and CUDA graph capture details
+  </Card>
+  <Card title="Tested models" icon="list-check" href="/reference/tested-models">
+    Full list of verified GGUF models with download links
+  </Card>
+</CardGroup>

@@ -1,0 +1,137 @@
+---
+title: "LLogos solution structure and backend abstraction"
+description: "Multi-project .NET solution with a zero-dependency core and pluggable backends. Covers IComputeBackend, ITensor, data flow, and memory ownership rules."
+keywords: ["architecture", "IComputeBackend", "ITensor", "solution structure", "backend", "inference engine", "GGUF", "KV cache"]
+---
+
+LLogos is organized as a multi-project .NET 10 solution where the core inference library carries zero hardware dependencies. Backends — CPU, CUDA, Vulkan, and Metal — are separate assemblies that implement a pair of interfaces (`IComputeBackend` and `ITensor`). The inference engine calls only those interfaces, so every operation executes identically regardless of which hardware the host application selects.
+
+## Solution structure
+
+Each project has a single, well-defined responsibility:
+
+| Project | Role |
+|---------|------|
+| **Daisi.Llogos** | GGUF parser, model loader, tokenizer, inference engine, sampling. Defines `IComputeBackend` and `ITensor`. Contains no hardware-specific code. |
+| **Daisi.Llogos.Cpu** | CPU compute backend using .NET SIMD intrinsics (`Vector256<T>`, `Vector512<T>`). Implements dequantization, matmul, RMSNorm, softmax, SiLU, and RoPE. |
+| **Daisi.Llogos.Cuda** | NVIDIA GPU backend. Raw P/Invoke to the CUDA Driver API, pre-compiled `.cubin` kernels, fused dequant+matmul. |
+| **Daisi.Llogos.Vulkan** | Cross-platform GPU backend using Vulkan compute shaders (SPIR-V). Targets Windows and Linux. |
+| **Daisi.Llogos.Metal** | Apple GPU backend using Metal compute shaders. Targets macOS (arm64/x64) and iOS via XCFramework. |
+| **Daisi.Llogos.Cli** | Command-line interface: model loading, text generation, interactive chat. Selects backend based on available hardware. |
+| **Daisi.Llogos.Tests** | Unit and integration tests (xUnit v3). Uses a real Qwen 3.5 0.8B Q8_0 model for integration validation. |
+
+The CLI and every backend depend on `Daisi.Llogos` (the core). The core depends on nothing outside the .NET BCL.
+
+## Compute backend abstraction
+
+`IComputeBackend` defines every tensor operation the inference engine needs. Backends must implement this interface in full; the engine never touches hardware APIs directly.
+
+### IComputeBackend
+
+```csharp
+public interface IComputeBackend : IDisposable
+{
+    // Identity
+    string Name { get; }
+
+    // Tensor lifecycle
+    ITensor CreateTensor(string name, GgmlType type, ReadOnlySpan<long> dimensions);
+    ITensor LoadTensor(string name, GgmlType type, ReadOnlySpan<long> dimensions, ReadOnlySpan<byte> data);
+
+    // Core math
+    void MatMul(ITensor output, ITensor a, ITensor b, int M, int K, int N);
+    void RmsNorm(ITensor output, ITensor input, ITensor weight, float eps);
+    void Softmax(ITensor output, ITensor input);
+    void SiLU(ITensor output, ITensor input);
+    void RoPE(ITensor q, ITensor k, int headDim, int ropeDim, int positionOffset, float ropeTheta);
+    void ElementMul(ITensor output, ITensor a, ITensor b);
+    void ElementAdd(ITensor output, ITensor a, ITensor b);
+    void EmbeddingLookup(ITensor output, ITensor table, int tokenId);
+
+    // Composite ops
+    void KvCacheWrite(ITensor kCache, ITensor vCache, ITensor k, ITensor v,
+        int nKvHeads, int keyLength, int valueLength, int maxSeqLen, int position);
+    void GatedAttention(ITensor output, ITensor qAttn, ITensor qGate,
+        ITensor kCache, ITensor vCache,
+        int numHeads, int numKvHeads, int keyLength, int valueLength,
+        int maxSeqLen, int seqLen, float scale);
+    void DeltaNetStep(ITensor output, ITensor q, ITensor k, ITensor v,
+        ITensor state, ITensor decay, ITensor beta,
+        ITensor normWeight, int groupCount, int headDim, float scale, float normEps);
+
+    // Fused ops (optional — backends provide optimized overrides)
+    void SwiGLU(ITensor output, ITensor gate, ITensor up);
+    void MatMulSwiGLU(ITensor output, ITensor a, ITensor gateWeights, ITensor upWeights,
+        int M, int K, int N);
+    void AddRmsNorm(ITensor output, ITensor hidden, ITensor a, ITensor b,
+        ITensor weight, float eps);
+}
+```
+
+`MatMul` accepts a quantized `b` tensor — the backend fuses dequantization into the multiply rather than requiring the caller to convert weights to FP32 first. Fused operations such as `MatMulSwiGLU` and `AddRmsNorm` have default implementations that call the primitives; high-performance backends (CUDA in particular) override them with single-kernel versions.
+
+### ITensor
+
+```csharp
+public interface ITensor : IDisposable
+{
+    string Name { get; }
+    GgmlType Type { get; }
+    ReadOnlySpan<long> Dimensions { get; }
+    long ElementCount { get; }
+    long ByteSize { get; }
+
+    void CopyFrom(ReadOnlySpan<byte> data);
+    void DequantizeTo(Span<float> destination);
+    Span<float> AsFloatSpan();            // F32 tensors only
+    void CopyRawTo(Span<byte> destination);
+}
+```
+
+`ITensor` is an opaque handle. For a CPU tensor it wraps a managed byte array; for a CUDA tensor it wraps a device pointer behind a `SafeHandle`. The inference engine never reads or writes tensor memory directly — it only calls `IComputeBackend` methods that operate on `ITensor` handles.
+
+## Design principles
+
+- **Backend owns tensors.** The backend allocates and manages all tensor memory. The inference engine holds handles (`ITensor` references) but never touches the underlying memory.
+- **No cross-backend tensors.** A tensor created by one backend cannot be passed to another. Model loading binds to a single backend for the entire session.
+- **Fused operations are optional.** Backends may implement fused operations (for example, dequant+matmul) as optimizations. The inference engine calls primitive operations; the backend decides internally whether to fuse them.
+- **Quantized math where possible.** Backends dequantize inside operations (for example, `MatMul` reads Q8_0 data and dequantizes on the fly) rather than converting all weights to FP32 at load time.
+
+## Data flow
+
+The path from a GGUF file on disk to generated text output passes through six stages:
+
+1. **Parse** — `GgufFile.Read()` reads the binary header, all metadata KV pairs, and tensor info descriptors. Tensor data is not loaded yet.
+2. **Load** — The model loader iterates tensor descriptors, reads raw bytes from the tensor data section, and calls `backend.LoadTensor()` to allocate and populate each tensor on the target device.
+3. **Tokenize** — The BPE tokenizer (vocabulary and merge rules extracted from GGUF metadata) converts input text to token IDs.
+4. **Prefill** — All prompt tokens are processed in one batched forward pass, populating the KV cache.
+5. **Decode loop** — Each iteration: run a forward pass for the last token, sample the next token from logits, append to the KV cache. Repeat until EOS or the token limit is reached.
+6. **Detokenize** — Generated token IDs are converted back to text and streamed to the caller.
+
+## Memory model
+
+The inference engine holds lightweight handles; all actual allocations live inside the backend:
+
+| Resource | Owner | Lifetime |
+|----------|-------|----------|
+| Weight tensors | Backend | Model load → model dispose |
+| KV cache | Backend | Model load → model dispose (grows with context) |
+| Scratch buffers | Backend | Allocated at model load, reused every forward pass |
+| Model config | Inference engine | Extracted from GGUF metadata at load time |
+| Token buffers | Inference engine | Per-generation, managed arrays |
+
+**Weights** are quantized and read-only after load. **KV cache** is FP16 or FP8 and grows one entry per token generated. **Scratch buffers** are FP32 and are overwritten each forward pass — they are never accumulated across steps.
+
+## Related references
+
+<CardGroup cols={3}>
+  <Card title="CUDA backend" icon="microchip" href="/reference/backends/cuda">
+    P/Invoke, cubin kernels, fused dequant+matmul
+  </Card>
+  <Card title="Vulkan backend" icon="layer-group" href="/reference/backends/vulkan">
+    SPIR-V compute shaders for cross-platform GPU
+  </Card>
+  <Card title="WebGPU backend" icon="globe" href="/reference/backends/webgpu">
+    WGSL shaders, browser Cache API, Node.js support
+  </Card>
+</CardGroup>

@@ -1,97 +1,69 @@
 ---
-title: "Introduction"
-description: "Welcome to the new home for your documentation"
+title: "LLogos: AI inference engine for any device"
+description: "Run GGUF language models on CPU, NVIDIA CUDA, Vulkan, WebGPU, and Apple Metal. Native C# and TypeScript — no Python, no wrappers."
 ---
 
-## Setting up
+LLogos is a native inference engine that runs quantized AI language models (in GGUF format) across every major compute platform. Written entirely in C# and TypeScript, it delivers hardware-direct performance from your gaming PC, a server cluster, or a web browser — with no Python dependencies and no wrapper libraries in the critical path.
 
-Get your documentation site up and running in minutes.
-
-<Card
-  title="Start here"
-  icon="rocket"
-  href="/quickstart"
-  horizontal
->
-  Follow our three step quickstart guide.
-</Card>
-
-## Make it yours
-
-Design a docs site that looks great and empowers your users.
-
-<Columns cols={2}>
-  <Card
-    title="Edit locally"
-    icon="pen-to-square"
-    href="/development"
-  >
-    Edit your docs locally and preview them in real time.
+<CardGroup cols={2}>
+  <Card title=".NET quickstart" icon="bolt" href="/quickstart-dotnet">
+    Run your first GGUF model on CPU, CUDA, or Vulkan in minutes
   </Card>
-  <Card
-    title="Customize your site"
-    icon="palette"
-    href="/essentials/settings"
-  >
-    Customize the design and colors of your site to match your brand.
+  <Card title="WebGPU quickstart" icon="browser" href="/quickstart-webgpu">
+    Inference in the browser or Node.js via @daisinet/llogos-webgpu
   </Card>
-    <Card
-    title="Set up navigation"
-    icon="map"
-    href="/essentials/navigation"
-  >
-    Organize your docs to help users find what they need and succeed with your product.
+  <Card title="Architecture overview" icon="sitemap" href="/concepts/architecture">
+    Backend abstraction, solution structure, and data flow
   </Card>
-  <Card
-    title="API documentation"
-    icon="terminal"
-    href="/api-reference/introduction"
-  >
-    Auto-generate API documentation from OpenAPI specifications.
+  <Card title="CLI reference" icon="terminal" href="/reference/cli/inference">
+    Full command reference for inference, training, and benchmarking
   </Card>
-</Columns>
+</CardGroup>
 
-## Create beautiful pages
+## Why LLogos
 
-Everything you need to create world-class documentation.
+LLogos targets developers who need inference performance without the Python ecosystem overhead. Every backend calls hardware APIs directly — CUDA Driver API via P/Invoke, Vulkan compute via SPIR-V shaders, WebGPU via WGSL — so there are no intermediate abstraction layers consuming cycles.
 
-<Columns cols={2}>
-  <Card
-    title="Write with MDX"
-    icon="pen-fancy"
-    href="/essentials/markdown"
-  >
-    Use MDX to style your docs pages.
+<CardGroup cols={2}>
+  <Card title="CUDA backend" icon="microchip" href="/reference/backends/cuda">
+    NVRTC JIT compilation, dp4a integer matmul, fused kernels — exceeds llama.cpp on 4 of 8 tested models
   </Card>
-  <Card
-    title="Code samples"
-    icon="code"
-    href="/essentials/code"
-  >
-    Add sample code to demonstrate how to use your product.
+  <Card title="Vulkan backend" icon="layer-group" href="/reference/backends/vulkan">
+    Cross-platform GPU inference on NVIDIA, AMD, and Intel — Windows and Linux
   </Card>
-  <Card
-    title="Images"
-    icon="image"
-    href="/essentials/images"
-  >
-    Display images and other media.
+  <Card title="WebGPU backend" icon="globe" href="/reference/backends/webgpu">
+    20+ WGSL shaders, DeltaNet support, browser Cache API model persistence
   </Card>
-  <Card
-    title="Reusable snippets"
-    icon="recycle"
-    href="/essentials/reusable-snippets"
-  >
-    Write once and reuse across your docs.
+  <Card title="LoRA training" icon="graduation-cap" href="/guides/lora-training">
+    Fine-tune GGUF models directly — GPU-accelerated AdamW, ChatML-aware masking
   </Card>
-</Columns>
+</CardGroup>
 
-## Need inspiration?
+## Platform support
 
-<Card
-  title="See complete examples"
-  icon="stars"
-  href="https://mintlify.com/customers"
->
-  Browse our showcase of exceptional documentation sites.
-</Card>
+| Platform | Backend | Status |
+|----------|---------|--------|
+| Windows x64 | CPU (AVX2/AVX-512) | Ready |
+| Windows x64 | CUDA 13 (NVIDIA) | Ready |
+| Windows x64 | Vulkan (NVIDIA/AMD/Intel) | Ready |
+| Browser / Node.js | WebGPU | Ready |
+| Linux x64 | CPU + Vulkan | Planned |
+| macOS arm64/x64 | Metal | Planned |
+| iOS arm64 | Metal (XCFramework) | Planned |
+
+## Key capabilities
+
+<CardGroup cols={2}>
+  <Card title="LLogos Turbo" icon="compress" href="/optimization/llogos-turbo">
+    8–12× KV cache compression via Walsh-Hadamard rotation — no calibration required
+  </Card>
+  <Card title="Grammar-constrained output" icon="brackets-curly" href="/guides/grammar-constrained">
+    Pure C# GBNF engine for structured JSON, tool calls, and custom formats
+  </Card>
+  <Card title="Hybrid GPU/CPU inference" icon="arrows-split-up-and-left" href="/guides/hybrid-inference">
+    Split model layers across VRAM and system RAM with --hybrid-layers
+  </Card>
+  <Card title="Long context (200K+)" icon="scroll" href="/guides/long-context">
+    Flash attention, paged KV cache, RAM offloading — 200K+ context on 16 GB GPU
+  </Card>
+</CardGroup>

@@ -1,0 +1,211 @@
+---
+title: "LLogos terminology and concept glossary"
+description: "Definitions for every term in LLogos docs: GGUF format, quantization types, inference concepts, compute backends, and long-context memory management."
+keywords: ["glossary", "definitions", "GGUF", "quantization", "KV cache", "GQA", "RoPE", "SwiGLU", "DeltaNet", "BPE", "LoRA", "GBNF"]
+---
+
+This glossary covers the terms used throughout LLogos documentation. Terms are grouped by topic area. Click any entry to expand its definition.
+
+## GGUF format
+
+<AccordionGroup>
+  <Accordion title="GGUF">
+    **GGPT Unified Format** — the binary file format for storing quantized LLM weights alongside all model configuration. Successor to the earlier GGML and GGJT formats. A single `.gguf` file contains a 24-byte header, typed metadata KV pairs (architecture, vocabulary, hyperparameters), tensor info descriptors, and the raw tensor data section.
+  </Accordion>
+  <Accordion title="Magic number">
+    The first 4 bytes of every GGUF file: `0x46554747` (ASCII `GGUF`). LLogos validates this field before parsing any further structure and throws `InvalidDataException` if it does not match.
+  </Accordion>
+  <Accordion title="Metadata KV">
+    Key-value pairs stored in the GGUF header. Keys are UTF-8 strings; values are one of 13 typed variants (uint8 through float64, plus string, bool, and array). They carry all model configuration: architecture name, context length, hidden dimension, attention head counts, vocabulary, BPE merge rules, and RoPE parameters.
+  </Accordion>
+  <Accordion title="Tensor info">
+    A descriptor for each weight tensor stored before the tensor data section. Contains: tensor name (e.g., `blk.0.attn_q.weight`), number of dimensions, dimension sizes, quantization type (`GgmlType`), and byte offset into the tensor data section. LLogos reads all tensor info descriptors at parse time without loading any weight data.
+  </Accordion>
+  <Accordion title="Alignment">
+    GGUF requires the tensor data section to start at a byte offset that is a multiple of the alignment value (default 32). Stored in the `general.alignment` metadata key. Individual tensors within the data section are stored contiguously without further padding, but the section itself must start at an aligned boundary.
+  </Accordion>
+</AccordionGroup>
+
+## Quantization
+
+<AccordionGroup>
+  <Accordion title="GgmlType">
+    An enum identifying a tensor's numeric format. 41 variants ranging from full-precision (F32, F16, BF16) to aggressively quantized (Q2_K, IQ1_S). Each variant defines a block size (number of elements per quantization block) and a type size (bytes per block). LLogos's `GgmlTypeInfo` class computes byte sizes from these parameters.
+  </Accordion>
+  <Accordion title="Block size">
+    The number of elements (weights) packed into one quantization block. Q8_0 and Q4_0 use 32 elements per block. K-quants (Q4_K, Q5_K, Q6_K, Q2_K, Q3_K) use 256 elements organized into 8 sub-blocks of 32.
+  </Accordion>
+  <Accordion title="Type size">
+    The number of bytes consumed by one quantization block. Q8_0: 34 bytes (32 int8 quantized values + 2-byte FP16 scale). Q4_0: 18 bytes (16 bytes of packed 4-bit values + 2-byte FP16 scale). Q4_K: 144 bytes per super-block of 256 elements.
+  </Accordion>
+  <Accordion title="Q8_0">
+    8-bit symmetric quantization. Each block holds 32 weights: 32 bytes of int8 values plus a 2-byte FP16 scale factor. 34 bytes per block, 8.5 bits per weight.
+
+    Dequantize: `weight[i] = scale × quant[i]`
+
+    The highest-quality quantization format LLogos uses for integration testing because it has simple dequantization and near-lossless quality relative to F16.
+  </Accordion>
+  <Accordion title="Q4_0">
+    4-bit symmetric quantization. Each block holds 32 weights packed as 4-bit nibbles into 16 bytes, plus a 2-byte FP16 scale. 18 bytes per block, 4.5 bits per weight.
+
+    Dequantize: `weight[i] = scale × (nibble[i] - 8)`
+
+    Weights are unsigned 0–15, re-centered by subtracting 8 to restore signed range −8…+7.
+  </Accordion>
+  <Accordion title="Q4_K">
+    K-quant 4-bit format. Uses a super-block of 256 elements with 8 sub-blocks of 32. Stores two FP16 master scalars (d, dmin) plus per-sub-block 6-bit scales and mins packed into 12 bytes, followed by 128 bytes of 4-bit nibbles. 144 bytes per super-block, 4.5 bits per weight.
+
+    More accurate than Q4_0 at the same bit-width because each sub-block has its own affine transform.
+
+    Recommended deployment format for most models.
+  </Accordion>
+  <Accordion title="K-quants">
+    The family of quantization formats — Q2_K, Q3_K, Q4_K, Q5_K, Q6_K — that use nested super-block / sub-block structures with per-sub-block affine scaling. More accurate than the legacy Q4_0/Q5_0 formats at similar bit-widths.
+  </Accordion>
+  <Accordion title="IQ-quants">
+    Importance-weighted quantization formats (IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ3_XXS, IQ4_XS, etc.). Use lookup tables and importance matrices derived from calibration data to achieve extremely low bit-widths with minimal quality loss compared to simple block quantization.
+  </Accordion>
+  <Accordion title="Q1_0 / Q1_0_g128">
+    1-bit binary sign quantization from the PrismML Bonsai project. Each weight is either `+scale` or `−scale` with no zero state.
+
+    **Q1_0**: 32 elements per block, 6 bytes (2-byte FP16 scale + 4 sign bytes). 1.5 bits/weight effective.
+
+    **Q1_0_g128**: 128 elements per block, 18 bytes (2-byte FP16 scale + 16 sign bytes). 1.125 bits/weight effective. Used by Bonsai-8B.
+
+    Dequantize: `weight[i] = (sign_bit[i] ? +1 : −1) × scale`
+  </Accordion>
+  <Accordion title="BF16">
+    Brain float16. Same exponent range as FP32 (8-bit exponent) with reduced precision (7-bit mantissa vs FP32's 23-bit). BF16→FP32 conversion is a single left-shift by 16 bits, making it cheaper to dequantize than FP16.
+  </Accordion>
+  <Accordion title="LoRA">
+    **Low-Rank Adaptation.** A fine-tuning technique that decomposes weight updates as `W' = W + (alpha/rank) × B × A`, where A is `[rank × in]` and B is `[out × rank]`. Only A and B are trained; the original W is frozen. LLogos stores LoRA adapters in the `.llra` binary format.
+  </Accordion>
+</AccordionGroup>
+
+## Model architecture
+
+<AccordionGroup>
+  <Accordion title="Transformer">
+    The dominant neural network architecture for language models. Processes tokens through repeated layers of self-attention and feed-forward networks, with residual connections and normalization at each sub-block. LLogos implements the transformer forward pass in `Daisi.Llogos` through `IComputeBackend` operations.
+  </Accordion>
+  <Accordion title="Attention head">
+    One parallel stream within multi-head attention. Each head independently projects the hidden state into query, key, and value subspaces, computes scaled dot-product attention, then concatenates results across all heads. The head dimension `d_head = hidden_dim / num_heads`.
+  </Accordion>
+  <Accordion title="KV cache">
+    Stores previously computed key and value tensors so they need not be recomputed on each decode step. The cache grows by one entry per generated token. Memory layout per layer: `[max_seq_len × kv_heads × head_dim]` for both K and V, stored in FP16 or FP8.
+  </Accordion>
+  <Accordion title="GQA (Grouped Query Attention)">
+    A memory-efficient attention variant where multiple query heads share the same key and value heads. Qwen 3.5 0.8B uses a 2:1 ratio: 16 query heads share 8 KV heads. GQA reduces KV cache memory proportionally to the GQA ratio while maintaining most of the quality of full multi-head attention.
+  </Accordion>
+  <Accordion title="RMSNorm">
+    Root Mean Square Layer Normalization. Normalizes activations by dividing each element by the RMS of the vector, then scaling by a learned weight:
+
+    `output[i] = (input[i] / sqrt(mean(input²) + eps)) × weight[i]`
+
+    Simpler and faster than LayerNorm — no mean subtraction and no bias term. Used before both the attention block and the FFN in each transformer layer.
+  </Accordion>
+  <Accordion title="RoPE (Rotary Position Embedding)">
+    Encodes token position by rotating pairs of dimensions in query and key vectors using sinusoidal frequencies. Applied after Q and K projections, before writing to the KV cache. Enables relative position awareness without explicit position tokens or absolute position embeddings.
+
+    For Qwen 3.5, `rope_base = 1,000,000` — a high value that extends effective context length by slowing the rotation rate of low-frequency dimensions.
+  </Accordion>
+  <Accordion title="SiLU">
+    **Sigmoid Linear Unit** activation: `SiLU(x) = x × σ(x)` where `σ` is the sigmoid function. Also called Swish. Used in the FFN gate projection of SwiGLU architectures.
+  </Accordion>
+  <Accordion title="SwiGLU">
+    A gated feed-forward network variant used by Qwen, LLaMA, and most modern LLMs:
+
+    ```
+    gate   = W_gate × input
+    up     = W_up × input
+    fused  = SiLU(gate) ⊙ up
+    output = W_down × fused
+    ```
+
+    More expressive than a plain two-layer FFN. Requires three weight matrices (`W_gate`, `W_up`, `W_down`) instead of two.
+  </Accordion>
+  <Accordion title="DeltaNet">
+    A linear attention variant that maintains a recurrent state matrix updated via delta rules. Replaces standard attention in select layers (18 of 24 layers in Qwen 3.5 0.8B) for O(1) per-token inference cost regardless of context length. The state size is fixed at approximately 1 MB per layer, compared to KV cache that grows linearly with context.
+  </Accordion>
+  <Accordion title="BPE tokenizer">
+    **Byte Pair Encoding** tokenizer. Splits text into subword tokens by iteratively merging the most frequent adjacent byte pairs from a learned vocabulary. The vocabulary and merge rules are stored in GGUF metadata under `tokenizer.ggml.tokens` and `tokenizer.ggml.merges`. LLogos builds the tokenizer from these metadata fields at model load time without requiring any external tokenizer library.
+  </Accordion>
+</AccordionGroup>
+
+## Inference
+
+<AccordionGroup>
+  <Accordion title="Forward pass">
+    One complete evaluation of the model: input tokens in, logits out. During generation, each forward pass produces a logit vector of size `vocab_size` representing unnormalized scores for every possible next token.
+  </Accordion>
+  <Accordion title="Prefill">
+    The first phase of generation: all prompt tokens are processed in a single batched forward pass. Populates the KV cache for every prompt position simultaneously. Compute-bound because it involves large matrix multiplications (`[seq_len × hidden_dim]` inputs).
+  </Accordion>
+  <Accordion title="Decode">
+    The generation phase after prefill: one token is generated per forward pass. Each step feeds the previously sampled token, appends one entry to the KV cache, and produces logits for the next position. Memory-bandwidth-bound because it reads the full KV cache (growing with each step) for a single query vector.
+  </Accordion>
+  <Accordion title="Logits">
+    Raw unnormalized scores output by the model's final linear layer (`output.weight`), one float per vocabulary token. Converted to probabilities via softmax before sampling. Temperature scaling, top-k filtering, and top-p filtering are applied to logits before softmax.
+  </Accordion>
+  <Accordion title="Sampling">
+    Selecting the next token from the logit distribution. LLogos applies strategies in order: repetition penalty → temperature → top-k → top-p → softmax → sample (or argmax if temperature = 0).
+  </Accordion>
+  <Accordion title="Temperature">
+    Scales logits before softmax: `logits / temperature`. Values below 1.0 make the distribution peakier (more deterministic); values above 1.0 flatten it (more random). Temperature = 0 is equivalent to greedy (argmax) decoding.
+  </Accordion>
+  <Accordion title="Top-k">
+    Keep only the k highest-probability tokens; zero out all others; renormalize. Limits the candidate set to the most likely options. `k = 1` is equivalent to greedy decoding.
+  </Accordion>
+  <Accordion title="Top-p (nucleus sampling)">
+    Sort tokens by probability descending; keep the smallest set whose cumulative probability reaches `p`; zero the rest; renormalize. The candidate set adapts to the shape of each distribution rather than being fixed at a constant k.
+  </Accordion>
+  <Accordion title="Repetition penalty">
+    Reduces the probability of tokens that have already appeared in the context. Applied by dividing the logits of previously seen tokens by the penalty value (> 1.0). A value of 1.0 has no effect; 1.3–1.5 is a typical range.
+  </Accordion>
+  <Accordion title="GBNF">
+    **GGML BNF** — a grammar-constrained sampling format adapted from EBNF. LLogos includes a pure C# GBNF engine that restricts sampling to only tokens that can legally continue the current partial grammar match. Used for structured outputs: JSON, tool calls, and custom formats.
+  </Accordion>
+</AccordionGroup>
+
+## Compute backends
+
+<AccordionGroup>
+  <Accordion title="IComputeBackend">
+    The C# interface every compute backend implements. Defines tensor lifecycle methods (`CreateTensor`, `LoadTensor`), math primitives (`MatMul`, `RmsNorm`, `RoPE`, `Softmax`, `SiLU`, `ElementMul`, `ElementAdd`), and composite operations (`KvCacheWrite`, `GatedAttention`, `DeltaNetStep`). The inference engine calls only this interface — it never touches hardware APIs directly.
+  </Accordion>
+  <Accordion title="ITensor">
+    An opaque handle to a tensor managed by a backend. Exposes shape (`Dimensions`, `ElementCount`, `ByteSize`), type (`GgmlType`), and data transfer methods (`CopyFrom`, `DequantizeTo`). For CPU backends, the backing store is a managed byte array. For GPU backends, it is a device pointer wrapped in a `SafeHandle`.
+  </Accordion>
+  <Accordion title="SIMD">
+    **Single Instruction, Multiple Data** — CPU instructions that operate on multiple values simultaneously. The CPU backend uses .NET's `Vector256<T>` (AVX2, 8 floats per instruction) and `Vector512<T>` (AVX-512, 16 floats per instruction) for matrix multiply and dequantization.
+  </Accordion>
+  <Accordion title="CUDA">
+    NVIDIA's GPU compute platform. LLogos's CUDA backend uses raw P/Invoke calls to the CUDA Driver API with pre-compiled `.cubin` kernels — no managed wrapper libraries in the critical path. Supports fused dequant+matmul kernels and batched prefill operations.
+  </Accordion>
+  <Accordion title="Vulkan">
+    Cross-platform GPU compute API. LLogos's Vulkan backend uses SPIR-V compute shaders and targets Windows and Linux on NVIDIA, AMD, and Intel GPUs.
+  </Accordion>
+  <Accordion title="Fused kernel">
+    A single GPU kernel that combines multiple operations (for example, dequantize + matrix multiply) to eliminate intermediate memory reads/writes. LLogos defines fused operations such as `MatMulSwiGLU` and `AddRmsNorm` in `IComputeBackend` with default implementations that call primitives; high-performance backends (CUDA) override them with single-kernel versions.
+  </Accordion>
+</AccordionGroup>
+
+## Long context
+
+<AccordionGroup>
+  <Accordion title="Flash attention">
+    A tiled attention algorithm that computes exact attention without materializing the full `seq_len × seq_len` score matrix. Uses online softmax (log-sum-exp correction) to combine tiles incrementally. Eliminates shared memory limits on context length and improves cache locality for long sequences.
+  </Accordion>
+  <Accordion title="Paged KV cache">
+    A KV cache allocated as fixed-size pages (for example, 256 tokens each) instead of a monolithic contiguous buffer. Pages are allocated on demand and can live in different memory tiers (VRAM, RAM, NVMe SSD). Eliminates pre-allocation waste and enables efficient memory management for variable-length contexts.
+  </Accordion>
+  <Accordion title="KV cache offloading">
+    Moving KV cache pages between memory tiers: VRAM (fast, limited) → system RAM (slower, larger) → NVMe SSD (slowest, largest). During attention, pages are streamed back to VRAM in chunks. Combined with flash attention tiling, this enables context lengths far exceeding GPU memory.
+  </Accordion>
+  <Accordion title="KV cache quantization">
+    Storing the KV cache in a lower-precision format (FP8 or Q8_0 instead of FP16) to reduce memory usage and bandwidth during decode. At Q8_0, the KV cache is roughly half the size of FP16, enabling approximately twice the context length at the same GPU memory budget.
+  </Accordion>
+  <Accordion title="Sliding window attention">
+    Attention restricted to the most recent W tokens instead of the full context. Reduces the KV cache to a fixed-size ring buffer with constant memory and constant compute per token regardless of total context length. Trade-off: cannot recall information beyond the window.
+  </Accordion>
+</AccordionGroup>

@@ -1,0 +1,115 @@
+{
+  "projectType": "sdk-library",
+  "projectName": "LLogos",
+  "projectDescription": "A native C# and TypeScript inference engine for running GGUF AI language models on CPU, NVIDIA CUDA, Vulkan, WebGPU, and Apple Metal.",
+  "theme": "aspen",
+  "primaryColor": "#f8c61e",
+  "lightColor": "#fbf9ec",
+  "darkColor": "#4e412f",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "quickstart-dotnet",
+              "quickstart-webgpu"
+            ]
+          },
+          {
+            "group": "Core Concepts",
+            "pages": [
+              "concepts/architecture",
+              "concepts/inference-pipeline",
+              "concepts/gguf-format",
+              "concepts/definitions"
+            ]
+          },
+          {
+            "group": "Guides",
+            "pages": [
+              "guides/lora-training",
+              "guides/long-context",
+              "guides/grammar-constrained",
+              "guides/hybrid-inference",
+              "guides/benchmarking"
+            ]
+          },
+          {
+            "group": "Optimization",
+            "pages": [
+              "optimization/llogos-turbo",
+              "optimization/inference-optimization"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Reference",
+        "groups": [
+          {
+            "group": "Compute Backends",
+            "pages": [
+              "reference/backends/cuda",
+              "reference/backends/vulkan",
+              "reference/backends/webgpu"
+            ]
+          },
+          {
+            "group": "Supported Architectures",
+            "pages": [
+              "reference/architectures/llama",
+              "reference/architectures/qwen2",
+              "reference/architectures/qwen3",
+              "reference/architectures/qwen35",
+              "reference/architectures/bitnet"
+            ]
+          },
+          {
+            "group": "CLI Reference",
+            "pages": [
+              "reference/cli/inference",
+              "reference/cli/training"
+            ]
+          },
+          {
+            "group": "Resources",
+            "pages": [
+              "reference/tested-models",
+              "reference/known-issues"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Multi-backend inference: CPU (AVX2/AVX-512), NVIDIA CUDA, Vulkan (cross-platform GPU), WebGPU (browser/Node.js)",
+    "Native C# implementation with zero external dependencies for the core library",
+    "LoRA fine-tuning directly on quantized GGUF models with GPU-accelerated AdamW optimizer",
+    "LLogos Turbo: 8-12x KV cache compression via Walsh-Hadamard rotation and scalar quantization",
+    "GBNF grammar-constrained generation for structured output (JSON, tool calls)",
+    "Hybrid GPU/CPU inference to split large models across VRAM and system RAM",
+    "Flash attention with paged KV cache and RAM offloading for 200K+ context",
+    "Support for 10+ quantization formats: Q8_0, Q4_0, Q4_K, Q5_K, Q6_K, BF16, F16, I2_S (BitNet), TQ1_0, Q1_0 (Bonsai 1-bit)",
+    "DaisiChain: layer-wise pipeline parallelism across multiple hosts",
+    "WebGPU browser inference via @daisinet/llogos-webgpu npm package (72 automated tests)"
+  ],
+  "publicApiSurface": [
+    "IComputeBackend — backend-agnostic compute interface (MatMul, RmsNorm, Softmax, SiLU, RoPE, ElementMul, ElementAdd)",
+    "ITensor — hardware-independent tensor handle (CopyFrom, CopyTo, Dispose)",
+    "GgufFile.Read(stream) — parse GGUF v2/v3 model files",
+    "ModelConfig.FromGguf(gguf) — extract model configuration from GGUF metadata",
+    "TokenizerFactory.FromGguf(gguf) — build BPE tokenizer from GGUF vocabulary",
+    "CpuBackend / CudaBackend / VulkanBackend — concrete backend implementations",
+    "LlogosEngine (TypeScript) — WebGPU inference engine for browser and Node.js",
+    "LlogosEngine.initGpu() — initialize WebGPU device",
+    "LlogosEngine.loadModel(url) — load GGUF model via HTTP with Cache API",
+    "LlogosEngine.generate(prompt) — async token generator (async iterable)",
+    "CLI: dotnet run --project Daisi.Llogos.Cli -- --model <path> --prompt <text> --backend <cpu|cuda|vulkan>",
+    "CLI: dotnet run --project Daisi.Llogos.Cli -- train --model <path> --data <jsonl> --rank <n> --backend <cuda>"
+  ]
+}

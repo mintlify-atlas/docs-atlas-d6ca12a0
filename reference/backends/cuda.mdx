@@ -1,0 +1,194 @@
+---
+title: "CUDA backend — NVIDIA GPU inference with LLogos"
+description: "CUDA Driver API P/Invoke, NVRTC cubin kernels, fused dequant+matmul for 11 quantization formats, and benchmarks for the LLogos CUDA backend on NVIDIA GPUs."
+---
+
+The LLogos CUDA backend delivers NVIDIA GPU inference through the CUDA Driver API via P/Invoke, with NVRTC JIT-compiled kernels and a comprehensive suite of fused compute operations.
+
+<Note>
+**Requirements:** NVIDIA GPU (Ampere / Ada Lovelace / Blackwell), CUDA 12 or 13, Windows x64. Linux support is planned.
+</Note>
+
+## Architecture
+
+The CUDA backend (`Daisi.Llogos.Cuda`) calls the **CUDA Driver API directly via P/Invoke** — not the CUDA Runtime API, not cuDNN, and no managed wrapper libraries. This gives full control over context management, kernel loading, and stream orchestration with zero intermediate abstraction overhead.
+
+Key design choices:
+
+| Decision | Detail |
+|----------|--------|
+| **API layer** | CUDA Driver API (`libcuda.so` / `nvcuda.dll`) via P/Invoke — no runtime DLL dependency |
+| **Kernel compilation** | Pre-compiled `.cubin` embedded as assembly resources — instant startup, no JIT at runtime |
+| **cuBLAS** | `cublasGemmEx` (FP16 tensor cores) and `cublasSgemv` (F32 GEMV) for standard matmul paths |
+| **dp4a integer dot product** | `__dp4a` hardware int8 multiply-accumulate for Q4_0 and Q8_0 on pre-Blackwell GPUs |
+| **Architecture-adaptive dispatch** | Blackwell (SM 12.x) uses float path for 4-bit quants; pre-Blackwell uses dp4a |
+| **Partial vocab logit computation** | `lm_head` computes VocabSize/32 tokens for greedy decode — ~10% speedup |
+| **SafeHandle resource management** | Every CUDA allocation wrapped in a `SafeHandle`-derived class — GPU memory freed on GC or exception |
+
+### P/Invoke bindings
+
+The static `CudaApi` class exposes the full CUDA Driver API surface needed for inference:
+
+```csharp
+CudaApi.cuInit(0);
+CudaApi.cuDeviceGet(out int device, ordinal: 0);
+CudaApi.cuCtxCreate(out CUcontext ctx, flags: 0, device);
+CudaApi.cuModuleLoadData(out CUmodule module, cubinBytes);
+CudaApi.cuModuleGetFunction(out CUfunction fn, module, "dequant_matmul_q8_0");
+CudaApi.cuLaunchKernel(fn, gridX, gridY, gridZ, blockX, blockY, blockZ,
+                       sharedBytes, stream, args, extras);
+```
+
+cuBLAS is loaded separately via `CublasApi` and `CublasLtApi` bindings.
+
+### Target architectures
+
+Kernels are pre-compiled to cubin for each supported SM architecture:
+
+| SM arch | GPU family | Examples |
+|---------|-----------|----------|
+| sm_86 | Ampere | RTX 3060–3090, A100 |
+| sm_89 | Ada Lovelace | RTX 4060–4090, L40 |
+| sm_100 | Blackwell | RTX 5060–5090, B200 |
+| sm_120 | Blackwell Ultra | B300 |
+
+## Memory management
+
+Weight tensors are uploaded once at model load time. All intermediate computation remains on device. Only the final logits vector is transferred back to host per decode step.
+
+| Data | Direction | Frequency |
+|------|-----------|-----------|
+| Model weights | Host → Device | Once at model load |
+| KV cache | Device only | Never transferred |
+| Scratch buffers | Device only | Never transferred |
+| Input token IDs | Host → Device | Once per generate call |
+| Logits | Device → Host | Once per decode step |
+
+## Fused dequant + matmul
+
+The most critical optimization combines dequantization and matrix multiplication into a single kernel pass. The naive approach dequantizes all weights to FP32 in global memory (4× the quantized size), then reads them again for matmul — two full passes over weight data. The fused approach loads a tile of quantized weights into shared memory, dequantizes into registers, and immediately uses them for the dot product accumulation — weight data is read exactly once.
+
+For Q4_0 and Q8_0 on pre-Blackwell GPUs, dequantization uses `__dp4a` hardware integer dot products with fused RmsNorm+Q8_1 quantization, so the activation is already in Q8_1 format ready for `dp4a` with zero extra overhead.
+
+### Kernel inventory
+
+| Kernel | Operation | Notes |
+|--------|-----------|-------|
+| `dequant_matmul_q8_0` | Fused dequant + matmul (Q8_0 × FP32) | Primary M=1 inference kernel |
+| `dequant_matmul_q4_0` | Fused dequant + matmul (Q4_0 × FP32) | dp4a on pre-Blackwell |
+| `dequant_matmul_q4_k` | Fused dequant + matmul (Q4_K × FP32) | K-quant models |
+| `dequant_to_f16` | Weight dequant to FP16 | For batch GemmEx tensor core path |
+| `convert_f32_to_f16` | Activation to FP16 | Cached per source tensor |
+| `batched_embedding_q8_0` | M-token embedding lookup | Single kernel for M lookups |
+| `causal_softmax_inplace` | Causal softmax | FP32 `[H×M×S]` for cuBLAS attention |
+| `batched_split_swiglu` | Batched split + SwiGLU | FP32 `[M×2N]` → `[M×N]` |
+| `rms_norm` | RMSNorm | Block-level reduction |
+| `batched_rope` | Batched rotary position embeddings | M tokens, per-token positions |
+| `softmax` | Numerically stable softmax | Max subtraction |
+| `rope` | RoPE encoding | Paired dimension rotation |
+| `element_mul` | Element-wise multiply | Residual / SwiGLU gate |
+| `element_add` | Element-wise add | Residual connections |
+
+### cuBLAS bindings
+
+| Function | Use |
+|----------|-----|
+| `cublasGemmEx` | FP16 batch matmul with tensor cores, FP32 accumulation |
+| `cublasGemmStridedBatchedEx` | Batched attention QK^T and SV — GQA via `strideA=0` for KV reuse |
+| `cublasSgemm` | FP32 fallback for F32 weights |
+| `cublasSgemv` | M=1 F32 vector-matrix multiply |
+
+## Quantization support
+
+Fused dequant+matmul kernels exist for every supported format. Block repacking aligns quantized data for efficient 4-byte `uint32` reads: Q8_0 blocks are repacked from 34 → 36 bytes, Q4_0 from 18 → 20 bytes.
+
+| Format | Matmul kernel | Notes |
+|--------|--------------|-------|
+| F32 | `cublasSgemv` | Float fallback |
+| F16 | `cublasGemmEx` | Tensor cores |
+| BF16 | Dedicated kernel | Full BF16 embedding + matmul |
+| Q8_0 | `dequant_matmul_q8_0` | dp4a on pre-Blackwell |
+| Q4_0 | `dequant_matmul_q4_0` | dp4a on pre-Blackwell, float on Blackwell |
+| Q4_1 | Fused kernel | Aligned repacking |
+| Q4_K | `dequant_matmul_q4_k` | Cooperative dp4a, 128 threads, 16 per super-block |
+| Q5_K | Fused kernel | Per-quant row count = 1 |
+| Q6_K | Fused kernel | Per-quant row count = 10 |
+| I2_S | Fused kernel | BitNet ternary weights |
+| TQ1_0 | Fused kernel | 1-bit quantization |
+
+Per-quant row count tuning (Q8_0=2, Q4_K=3, Q6_K=10, Q4_0=2, Q4_1=8, Q5_K=1) is set per format for optimal occupancy. Each quantization type computes its own grid/threads/shared memory via `AdaptiveLaunch()` — no shared global state between dispatches.
+
+## Composite GPU operations
+
+Beyond matmul, the CUDA backend implements 16+ fused composite operations that eliminate intermediate global memory round-trips:
+
+| Operation | Kernel file | Description |
+|-----------|------------|-------------|
+| `GatedAttention` | `composite_ops.cu` | Tiled gated attention with online softmax |
+| `DeltaNetStep` | `composite_ops.cu` | DeltaNet state update + output + per-head RMSNorm |
+| `CausalConv1d` | `composite_ops.cu` | Fused causal conv1d + SiLU with persistent state |
+| `ComputeDecayBeta` | `composite_ops.cu` | Softplus + exp decay, sigmoid beta |
+| `RmsNormResidual` | `composite_ops.cu` | RMSNorm + Q8_1 quantization of residual |
+| `AddRmsNorm` | `composite_ops.cu` | Add residual + RMSNorm + Q8_1 quantization |
+| `SwiGLU` | `composite_ops.cu` | Gate × up projection + SiLU |
+| `SplitUnequalQKV` | `composite_ops.cu` | Split Q/K/V from unequal projection |
+| `RepeatTile` | `composite_ops.cu` | Tile KV heads for grouped-query attention |
+| `ArgMax` | `composite_ops.cu` | GPU-side argmax (no logit D2H transfer for greedy) |
+| `BatchedMMQ` | `batched_mmq.cu` | Batched multi-query matmul |
+| `SiLUInplace` | `elementwise.cu` | In-place SiLU activation |
+| `L2NormGroups` | `elementwise.cu` | Per-group L2 normalization |
+
+The Q8_1 activation cache uses generation-based invalidation — only write operations bump the generation counter, so repeated reads of the same activation reuse the cached Q8_1 result.
+
+## Multi-stream pipeline
+
+Two CUDA streams — a compute stream and a transfer stream — allow the final logits device-to-host copy to overlap with the last layer's computation. All weight data is already on device after model load, so there is no upload to overlap during inference.
+
+## Benchmarks
+
+Measured on AMD Ryzen 9 9900X + NVIDIA RTX 5080, 128 decode tokens, FP16 KV cache. Compared against llama.cpp b8461.
+
+| Model | LLogos CUDA (tok/s) | llama.cpp CUDA (tok/s) | Ratio | LLogos Vulkan (tok/s) |
+|-------|--------------------:|----------------------:|------:|----------------------:|
+| Qwen3.5-0.8B Q8_0 | **441** | 399 | **110%** | 156 |
+| TinyLlama 1.1B Q8_0 | **448** | 443 | **101%** | — |
+| Qwen3.5-4B Q8_0 | **144** | 135 | **107%** | 73 |
+| Qwen3-8B Q8_0 | 91 | 92 | 99% | 56 |
+| DeepSeek R1 8B Q8_0 | 94 | 95 | 99% | — |
+| Qwen3-8B Q4_K_M | **127** | 138 | **92%** | 54 |
+| Qwen3.5-9B Q8_0 | **88** | 84 | **105%** | 53 |
+| Qwen3.5-9B Q4_0 | 101 | 123 | 82% | 45 |
+
+LLogos exceeds llama.cpp on 4 of 8 tested models across DeltaNet, LLaMA, and standard attention architectures. The Q4_K_M gap was reduced from 10% to 8% via fused SwiGLU matmul, Q6_K kernel optimization, and cooperative dp4a kernels.
+
+## Usage
+
+```bash
+dotnet run --project src/Daisi.Llogos.Cli -- \
+    --model C:\GGUFS\Qwen3.5-0.8B-Q8_0.gguf \
+    --prompt "Hello, world" \
+    --backend cuda
+```
+
+Run a benchmark with separate prefill and decode timing:
+
+```bash
+dotnet run --project src/Daisi.Llogos.Cli -- \
+    --model C:\GGUFS\Qwen3.5-0.8B-Q8_0.gguf \
+    --bench --backend cuda
+```
+
+<CardGroup cols={2}>
+  <Card title="Vulkan backend" icon="layer-group" href="/reference/backends/vulkan">
+    Cross-platform GPU inference on NVIDIA, AMD, and Intel
+  </Card>
+  <Card title="WebGPU backend" icon="globe" href="/reference/backends/webgpu">
+    Browser and Node.js inference via WGSL compute shaders
+  </Card>
+  <Card title="Inference optimization" icon="bolt" href="/optimization/inference-optimization">
+    dp4a, fused kernels, and the CUDA optimization white paper
+  </Card>
+  <Card title="Tested models" icon="list-check" href="/reference/tested-models">
+    Verified models, quantization formats, and per-model benchmarks
+  </Card>
+</CardGroup>

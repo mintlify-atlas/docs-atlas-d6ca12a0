@@ -1,0 +1,96 @@
+---
+title: "Qwen 2/2.5 architecture support in LLogos"
+description: "Qwen 2 and 2.5 extend LLaMA with learned attention biases on Q, K, and V projections. LLogos handles these biases natively across CPU, CUDA, and Vulkan."
+keywords: ["qwen2", "qwen2.5", "gguf", "architecture", "attention bias", "gqa", "chatml"]
+---
+
+Qwen 2 and 2.5 models extend the LLaMA baseline with attention biases applied to Q, K, and V projections. LLogos handles these biases natively in its attention computation, and all backends — CPU, CUDA, Vulkan, and WebGPU — apply them correctly.
+
+## GGUF architecture identifier
+
+The `qwen2` architecture string is set in the GGUF metadata under the `general.architecture` key. Models in both the Qwen 2 and Qwen 2.5 lineages use this same identifier.
+
+## Key difference from LLaMA
+
+The only structural difference from a standard LLaMA layer is that each of the Q, K, and V linear projections has a **learned bias vector** added after the matrix multiply:
+
+```
+Attention with biases (Qwen2-specific)
+=======================================
+
+normOut ──> Q projection ──> + Q_bias ──> RoPE ──> ...
+            K projection ──> + K_bias ──> RoPE ──> KV cache
+            V projection ──> + V_bias ─────────> KV cache
+```
+
+Without these biases the model produces complete garbage — even 0.5B models fail entirely. The bias vectors encode critical offset information learned during training.
+
+<Note>
+Qwen 2/2.5 has **no gated Q projection** and **no per-head Q/K norms**. Those features appear in Qwen 3 and later. The only addition over LLaMA is the three attention bias vectors.
+</Note>
+
+## Feature summary
+
+| Feature | Details |
+|---------|---------|
+| Attention biases | Per-dimension bias vectors on Q, K, and V projections |
+| Grouped Query Attention | Standard GQA, same as LLaMA |
+| RoPE | Applied to Q and K after bias addition |
+| Chat format | ChatML — `<\|im_start\|>role\ncontent<\|im_end\|>` |
+| No gated Q | Standard single-output Q projection |
+| No Q/K norms | No per-head RMSNorm on Q or K |
+
+## Implementation notes
+
+**Loading biases from GGUF.** The tensors `attn_q.bias`, `attn_k.bias`, and `attn_v.bias` are loaded via `TryLoadTensor` in both the standard `ModelLoader` and the memory-mapped `MmapModelLoader`. If a tensor is absent — for example in a non-Qwen2 model loaded through this path — it is silently skipped.
+
+**ElementAdd for bias application.** After the Q, K, and V projections, LLogos applies `ElementAdd(q, q, q_bias)` before RoPE. This runs in the shared attention path so both single-token decode and batched prefill benefit from the same code.
+
+**Backend parity.** The WebGPU backend already supported Qwen2 biases from an earlier implementation. The CPU/CUDA/Vulkan backends were brought to parity. All four backends produce identical outputs on Qwen2.5-0.5B Q8_0.
+
+## Supported quantization formats
+
+Q8_0, Q4_0, Q4_1, Q4_K_M, Q5_K_M, Q6_K, F16, BF16, F32
+
+## Supported models
+
+| Model | Parameters | Tested quants | Notes |
+|-------|-----------|---------------|-------|
+| Qwen2.5-0.5B | 0.5B | Q8_0 | Fully verified, attention biases required |
+| Qwen2.5-7B | 7B | Q8_0 | Listed in architecture family; benchmark data pending |
+
+## Benchmarks
+
+Measured on AMD Ryzen 9 9900X + NVIDIA RTX 5080, 128 decode tokens, FP16 KV cache.
+
+| Model | Quant | LLogos CUDA (tok/s) | Notes |
+|-------|-------|--------------------:|-------|
+| Qwen2.5-0.5B | Q8_0 | ~200 | Small model, fast decode |
+
+### WebGPU
+
+Measured via Dawn WebGPU (Node.js), NVIDIA RTX 5090, 32 decode tokens.
+
+| Model | Prefill (tok/s) | Decode (tok/s) | VRAM |
+|-------|----------------:|---------------:|-----:|
+| Qwen2.5-0.5B Q8_0 | 42 | 37 | 1592 MB |
+
+## Known quirks and limitations
+
+- **Biases are mandatory.** Skipping or zeroing the Q/K/V bias tensors causes immediately broken output. There is no graceful degradation — the model must have these tensors present in the GGUF file.
+- **Qwen2.5-7B not yet benchmarked.** Inference runs correctly but no throughput numbers have been published for this model size.
+
+<CardGroup cols={2}>
+  <Card title="LLaMA architecture" icon="layer-group" href="/reference/architectures/llama">
+    Baseline transformer — no attention biases, no gating
+  </Card>
+  <Card title="Qwen 3 architecture" icon="layer-group" href="/reference/architectures/qwen3">
+    Gated Q projection, per-head norms, and Bonsai 1-bit quantization
+  </Card>
+  <Card title="CUDA backend" icon="microchip" href="/reference/backends/cuda">
+    Fused kernels and per-quant dispatch details
+  </Card>
+  <Card title="Tested models" icon="list-check" href="/reference/tested-models">
+    Full list of verified GGUF models with download links
+  </Card>
+</CardGroup>

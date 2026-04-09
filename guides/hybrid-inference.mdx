@@ -1,0 +1,85 @@
+---
+title: 'Split model layers across GPU and CPU memory'
+description: 'Run models that exceed your GPU VRAM by offloading layers to system RAM, or distribute layers across hosts with DaisiChain pipeline parallelism.'
+---
+
+Hybrid inference lets you run models larger than your GPU's VRAM by splitting layers across GPU and system RAM.
+
+When a model fits entirely in VRAM, LLogos loads all layers to the GPU and runs at full speed. When it doesn't fit, `--hybrid-layers N` places the first N layers on GPU and runs the remainder on CPU. The two sides communicate via the hidden state — a vector of roughly 20 KB that passes between layers — rather than transferring weight data across the PCIe bus every step.
+
+## Hybrid GPU/CPU with --hybrid-layers
+
+```bash
+# First 24 layers on GPU, remaining layers on CPU
+dotnet run --project src/Daisi.Llogos.Cli -- \
+    --model C:\GGUFS\Qwen3.5-9B-Q8_0.gguf \
+    --backend cuda --hybrid-layers 24 \
+    --prompt "Hello"
+```
+
+The GPU handles the first N layers using VRAM bandwidth (960 GB/s on RTX 5080). The CPU handles the remaining layers using system RAM bandwidth (approximately 80 GB/s on DDR5). At each boundary, only the hidden state — roughly 20 KB for a 9B model — crosses from GPU to CPU or back.
+
+<Note>
+  VRAM bandwidth is approximately 960 GB/s on an RTX 5080 vs roughly 80 GB/s for DDR5 system RAM — a 12× difference. GPU layers run at maximum throughput; CPU layers are limited by system memory bandwidth. Placing the most compute-intensive early layers on GPU and overflow layers on CPU typically gives the best throughput for memory-constrained setups.
+</Note>
+
+### When to use hybrid vs full GPU
+
+| Scenario | Recommendation |
+|----------|---------------|
+| Model fits in VRAM | Full GPU load — fastest, no configuration needed |
+| Model slightly exceeds VRAM | `--hybrid-layers N` with N chosen to fill VRAM |
+| Model far exceeds VRAM | Pipeline mode (`--pipeline`) for layer-by-layer streaming |
+| Very large model across machines | DaisiChain for distributed pipeline parallelism |
+
+### Choosing N
+
+Set N to the number of layers that fit in available VRAM after reserving space for the KV cache and DeltaNet state. For Qwen 3.5 9B Q8_0 (roughly 9 GB total weights) on a 16 GB GPU, the first 32–40 layers fit comfortably alongside the KV cache. Check decode throughput at different values of N — increasing N until VRAM OOM, then stepping back.
+
+## Pipeline mode: layer-by-layer weight streaming
+
+When a model cannot fit in VRAM at all, `--pipeline` streams one layer at a time from pre-split shard files:
+
+```bash
+# First, split the model into per-layer shard files (one-time)
+dotnet run --project src/Daisi.Llogos.Cli -- split \
+    --model C:\GGUFS\Qwen3.5-27B-Q4_0.gguf \
+    --align-gpu
+
+# Run inference in pipeline mode
+dotnet run --project src/Daisi.Llogos.Cli -- \
+    --model C:\GGUFS\Qwen3.5-27B-Q4_0.gguf \
+    --backend cuda --pipeline \
+    --prompt "Hello"
+```
+
+The `split` subcommand creates a `<model>.shards/` directory containing a shard file per layer, plus separate files for embeddings and the output head. The `--align-gpu` flag pre-converts weights to GPU-ready format, saving conversion work during inference.
+
+During pipeline inference, only one layer's weights occupy VRAM at a time (approximately 250 MB for a 27B model). The embedding table and output head are loaded once and kept resident. The hidden state (~20 KB) is the only data that persists between layer steps.
+
+Performance comparison for Qwen 3.5 27B Q4_0 on RTX 5080 (16 GB):
+
+| Mode | Decode speed | VRAM for weights |
+|------|:-----------:|:----------------:|
+| Full GPU load | 2.66 tok/s | 15 GB |
+| Hybrid (56 GPU + 8 CPU layers) | 1.34 tok/s | ~14 GB |
+| Per-layer pipeline | 0.40 tok/s | ~1 GB |
+| CPU only | 0.24 tok/s | 0 |
+
+Pipeline mode is 1.7× faster than CPU while using only 7% of the VRAM that full loading requires.
+
+## DaisiChain: pipeline parallelism across hosts
+
+DaisiChain extends pipeline parallelism to multiple machines. Each host loads only its assigned layer range from shard files; the hidden state passes between hosts after each completes its layers:
+
+```
+Host A (layers 0-15)  →  hidden state (20 KB)  →  Host B (layers 16-31)
+                                                          ↓
+                                             hidden state (20 KB)
+                                                          ↓
+                                             Host C (layers 32-47)  → ...
+```
+
+Because shard files enable partial downloads, each host downloads only the layers it processes — roughly a 4× reduction in total data transferred compared to distributing the full model file to every host.
+
+The output of DaisiChain pipeline parallelism is byte-identical to single-process inference — the hidden state transfer is the only communication between stages, and the same hidden state values flow through whether computation happens on one machine or many.

@@ -1,0 +1,158 @@
+---
+title: "Vulkan backend — cross-platform GPU inference"
+description: "SPIR-V 1.3 compute shaders, cross-vendor GPU support (NVIDIA, AMD, Intel), full quantization coverage, and benchmarks for the LLogos Vulkan backend."
+---
+
+The LLogos Vulkan backend provides cross-platform GPU inference using Vulkan 1.2 compute shaders (SPIR-V 1.3), targeting NVIDIA, AMD, and Intel GPUs on Windows and Linux.
+
+<Note>
+**Any Vulkan 1.2-capable GPU works** — NVIDIA, AMD, Intel, and Qualcomm. Unlike the CUDA backend, no vendor-specific toolchain is required.
+</Note>
+
+## Architecture
+
+The Vulkan backend (`Daisi.Llogos.Vulkan`) uses the same `IComputeBackend` / `ITensor` abstractions as the CPU and CUDA backends, making it transparent to the inference engine. It calls Vulkan via P/Invoke to `vulkan-1.dll` on Windows and `libvulkan.so` on Linux.
+
+Key differences from the CUDA backend:
+
+| Aspect | Vulkan | CUDA |
+|--------|--------|------|
+| **API style** | Explicit command buffer recording + fence-based synchronization | Imperative kernel launch |
+| **Shader language** | GLSL compiled to SPIR-V at build time | CUDA C++ compiled to cubin via nvcc |
+| **Memory model** | Explicit device-local + host-visible staging buffers | Unified device memory with `cuMemAlloc` |
+| **Vendor support** | NVIDIA, AMD, Intel, Qualcomm | NVIDIA only |
+
+### Source files
+
+| File | Purpose |
+|------|---------|
+| `VulkanApi.cs` | P/Invoke declarations for ~40 Vulkan API functions |
+| `VulkanStructs.cs` | Vulkan structures (`VkBufferCreateInfo`, `VkMemoryRequirements`, etc.) |
+| `VulkanDevice.cs` | Instance + physical device + logical device + compute queue + command buffer |
+| `VulkanBuffer.cs` | Device memory allocation with host-visible staging support |
+| `VulkanPipeline.cs` | SPIR-V shader loading, compute pipeline, descriptor set management |
+| `VulkanTensor.cs` | `ITensor` backed by device buffer + staging buffer |
+| `VulkanBackend.cs` | `IComputeBackend` — dispatches compute shaders for all 23 operations |
+
+## Compute shaders
+
+GLSL shaders are compiled to SPIR-V at build time using `glslc` from the Vulkan SDK, then embedded as assembly resources in `Daisi.Llogos.Vulkan.dll`.
+
+| Shader | Operations |
+|--------|-----------|
+| `dequant_matmul.comp` | Fused dequant+matmul (F32, Q8_0, Q4_0, Q4_1, Q4_K, Q5_K, Q6_K, I2_S, TQ1_0, F16) |
+| `matmul_q8_0_aligned.comp` | Dedicated aligned Q8_0 matmul with optimized `uint32` reads |
+| `dequant_matmul_bda.comp` | Buffer device address matmul variant |
+| `embedding.comp` | Embedding lookup (F32, Q8_0, Q4_0, Q4_1, Q4_K, F16) |
+| `composite_ops.comp` | SiLU in-place, SiLU gate, split QKV, de-interleave Q, L2 norm, per-head RMSNorm, KV cache write, compute decay/beta, causal conv1d |
+| `gated_attention.comp` | Tiled gated attention with online softmax |
+| `deltanet_step.comp` | DeltaNet state update + output + per-head RMSNorm |
+| `elementwise.comp` | RMSNorm |
+| `softmax.comp` | Numerically stable softmax |
+| `silu.comp` | SiLU activation |
+| `rope.comp` | Rotary position embeddings |
+| `element_ops.comp` | Element-wise add/multiply |
+
+## Quantization support
+
+The fused dequant+matmul shader handles every supported quantization format in a single compute pass:
+
+| Format | Matmul | Embedding |
+|--------|--------|-----------|
+| F32 | Fused kernel | Supported |
+| F16 | Fused kernel | Supported |
+| Q8_0 | Aligned kernel (uint32 reads) | Supported |
+| Q4_0 | Fused kernel | Supported |
+| Q4_1 | Fused kernel | Supported |
+| Q4_K | Fused kernel | Supported |
+| Q5_K | Fused kernel | — |
+| Q6_K | Fused kernel | — |
+| I2_S | Fused kernel | — |
+| TQ1_0 | Fused kernel | — |
+
+The `matmul_q8_0_aligned.comp` shader repacks Q8_0 blocks from 34 → 36 bytes so every block boundary falls on a 4-byte boundary, enabling efficient `uint32` reads across all GPU vendors.
+
+## Composite operations
+
+The Vulkan backend includes the same suite of fused composite operations as the CUDA backend, implemented in `composite_ops.comp`:
+
+| Operation | Description |
+|-----------|-------------|
+| `RmsNormResidual` | RMSNorm with residual addition |
+| `AddRmsNormResidual` | Add + RMSNorm + residual |
+| `SplitSwiGLU` | Split gate/up + SiLU activation (SwiGLU) |
+| `RepeatTile` | Tile KV heads for grouped-query attention |
+| `ArgMax` | GPU-side argmax — no logit transfer for greedy decode |
+| `CausalConv1d` | Fused causal conv1d + SiLU with persistent state |
+| `ComputeDecayBeta` | Softplus + exp decay, sigmoid beta (DeltaNet) |
+| `DeltaNetStep` | Full DeltaNet state update + output + per-head RMSNorm |
+
+## Memory management
+
+Every `VulkanTensor` maintains two buffers: a device-local buffer for fast GPU access and a host-visible staging buffer for CPU transfers. Weight tensors are uploaded once at model load. Logits are downloaded once per generated token.
+
+```
+Upload:   CPU → staging buffer → vkCmdCopyBuffer → device-local buffer
+Download: device-local buffer → vkCmdCopyBuffer → staging buffer → CPU
+```
+
+## Dispatch pattern
+
+Every compute operation follows the same sequence:
+
+1. Allocate a descriptor set from the pipeline's pool
+2. Bind buffer handles to descriptor set bindings
+3. Record command buffer: bind pipeline → bind descriptor set → push constants → dispatch
+4. Submit command buffer to the compute queue
+5. Wait for fence
+
+Push constants carry per-dispatch parameters (matrix dimensions, quantization scales, etc.) without descriptor set updates.
+
+## Key optimizations
+
+- **`uint32` buffer views** — quantized weight data accessed as packed 32-bit words; avoids byte-granularity reads on some vendors
+- **Aligned Q8_0 repacking** — 34 → 36 byte block alignment for uniform `uint32` access
+- **Subgroup arithmetic reduction** — uses Vulkan 1.1 subgroup operations (`gl_SubgroupSize`, `subgroupAdd`) for RMSNorm and softmax reductions
+- **Multi-row workgroups** — multiple output rows per workgroup improve occupancy on wide FFN layers
+- **Vulkan 1.2 + SPIR-V 1.3** — uses `VK_KHR_buffer_device_address` and `VK_EXT_subgroup_size_control` where available
+
+## Benchmarks
+
+Measured on AMD Ryzen 9 9900X + NVIDIA RTX 5080, 128 decode tokens, FP16 KV cache.
+
+| Model | LLogos Vulkan (tok/s) | LLogos CUDA (tok/s) |
+|-------|----------------------:|--------------------:|
+| Qwen3.5-0.8B Q8_0 | 156 | 441 |
+| Qwen3.5-4B Q8_0 | 73 | 144 |
+| Qwen3-8B Q8_0 | 56 | 91 |
+| Qwen3-8B Q4_K_M | 54 | 127 |
+| Qwen3.5-9B Q8_0 | 53 | 88 |
+| Qwen3.5-9B Q4_0 | 45 | 101 |
+
+The Vulkan backend runs on every GPU where CUDA is unavailable — AMD and Intel included. On NVIDIA hardware, CUDA is faster due to dp4a integer dot products and cuBLAS tensor cores.
+
+## Usage
+
+```bash
+dotnet run --project src/Daisi.Llogos.Cli -- \
+    --model C:\GGUFS\Qwen3.5-0.8B-Q8_0.gguf \
+    --prompt "Hello, world" \
+    --backend vulkan
+```
+
+The runtime automatically tries CUDA first, then Vulkan, then CPU if the preferred backend is unavailable. Pass `--backend vulkan` to force Vulkan regardless of CUDA availability.
+
+<CardGroup cols={2}>
+  <Card title="CUDA backend" icon="microchip" href="/reference/backends/cuda">
+    NVIDIA-specific backend with dp4a and tensor core optimizations
+  </Card>
+  <Card title="WebGPU backend" icon="globe" href="/reference/backends/webgpu">
+    Browser and Node.js inference via WGSL compute shaders
+  </Card>
+  <Card title="Tested models" icon="list-check" href="/reference/tested-models">
+    Verified models, quantization formats, and per-model benchmarks
+  </Card>
+  <Card title="CLI reference" icon="terminal" href="/reference/cli/inference">
+    Full command reference including --backend and --hybrid-layers
+  </Card>
+</CardGroup>

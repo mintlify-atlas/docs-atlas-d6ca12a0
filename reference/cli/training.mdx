@@ -1,0 +1,319 @@
+---
+title: "LLogos train subcommand — LoRA training reference"
+description: "Complete reference for the daisi-llogos train subcommand: LoRA ranks, targets, AdamW optimizer settings, data formats, and GPU-accelerated fine-tuning."
+---
+
+The `train` subcommand runs native LoRA fine-tuning on GGUF models, with GPU-accelerated forward and backward passes and an AdamW optimizer with cosine warmup.
+
+LoRA adapters are saved as `.llra` files and can be loaded at inference time with `--lora`. Merging is done at load time and has zero runtime overhead.
+
+## Usage
+
+```bash
+daisi-llogos train --model <path> --data <path> [options]
+```
+
+`--model` and `--data` are required. All other flags are optional and have sensible defaults.
+
+---
+
+## Required flags
+
+<ParamField path="--model" type="string" required>
+  Path to the base GGUF model file to fine-tune. Short form: `-m`.
+
+  ```bash
+  --model C:\GGUFS\Qwen3.5-9B-Q8_0.gguf
+  ```
+</ParamField>
+
+<ParamField path="--data" type="string" required>
+  Path to the training data file. Accepts plain text (`.txt`), JSONL with a `"text"` field, or JSONL with `"prompt"` and `"completion"` fields. Format is auto-detected from content. Short form: `-d`.
+
+  ```bash
+  --data training_data.jsonl
+  ```
+</ParamField>
+
+---
+
+## Output
+
+<ParamField path="--output" type="string">
+  Output path for the trained adapter file. Must use the `.llra` extension. Default: `<model>.llra` (same directory and base name as the model). Short form: `-o`.
+
+  ```bash
+  --output my-adapter.llra
+  ```
+</ParamField>
+
+---
+
+## LoRA configuration
+
+<ParamField path="--rank" type="integer">
+  LoRA rank — the inner dimension of the low-rank decomposition matrices A and B. Higher rank captures more parameters but requires more memory and compute. Default: `8`. Short form: `-r`.
+
+  Common values: `4`, `8`, `16`, `32`. A rank of 8 with `--alpha 16` gives an effective scaling of 2.0.
+
+  ```bash
+  --rank 8
+  ```
+</ParamField>
+
+<ParamField path="--alpha" type="float">
+  LoRA alpha scaling factor. Controls the magnitude of the adapter's contribution: `scale = alpha / rank`. Default: `16`.
+
+  With `--rank 8 --alpha 16` the effective scale is `2.0`. With `--rank 8 --alpha 8` the scale is `1.0`.
+
+  ```bash
+  --alpha 16
+  ```
+</ParamField>
+
+<ParamField path="--targets" type="string">
+  Comma-free string of letters specifying which weight matrices to adapt. Default: `qkvo`.
+
+  | Letter | Projection |
+  |--------|-----------|
+  | `q` | Query projection |
+  | `k` | Key projection |
+  | `v` | Value projection |
+  | `o` | Output projection |
+  | `f` | All FFN projections (gate, up, down) |
+  | `d` | DeltaNet projections (delta\_qkv, delta\_out) |
+  | `all` | Every supported projection |
+
+  ```bash
+  --targets qkvo        # attention only (default)
+  --targets qkvod       # attention + DeltaNet
+  --targets qkvofd      # attention + FFN + DeltaNet
+  --targets all         # everything
+  ```
+</ParamField>
+
+<ParamField path="--backend" type="string">
+  Compute backend for training. Options: `cpu` (default), `cuda`. Vulkan is not supported for training. Short form: `-b`.
+
+  GPU training is strongly recommended — CUDA training runs ~30× faster than CPU on an RTX 5080 for 9B Q8\_0 models.
+
+  ```bash
+  --backend cuda
+  ```
+</ParamField>
+
+---
+
+## Training hyperparameters
+
+<ParamField path="--lr" type="float">
+  Learning rate for the AdamW optimizer. Default: `1e-4` (0.0001).
+
+  ```bash
+  --lr 1e-4
+  --lr 5e-5
+  ```
+</ParamField>
+
+<ParamField path="--epochs" type="integer">
+  Number of full passes over the training data. Default: `3`.
+
+  ```bash
+  --epochs 5
+  ```
+</ParamField>
+
+<ParamField path="--seq-len" type="integer">
+  Token sequence length for training batches. Longer sequences capture more context but require more VRAM. Default: `512`.
+
+  ```bash
+  --seq-len 1024
+  ```
+</ParamField>
+
+<ParamField path="--warmup" type="integer">
+  Number of linear warmup steps at the start of training. The learning rate ramps from 0 to `--lr` over these steps, then follows a cosine decay schedule. Default: `50`.
+
+  ```bash
+  --warmup 100
+  ```
+</ParamField>
+
+<ParamField path="--weight-decay" type="float">
+  AdamW weight decay (L2 regularization coefficient). Default: `0.01`.
+
+  ```bash
+  --weight-decay 0.01
+  ```
+</ParamField>
+
+<ParamField path="--max-grad-norm" type="float">
+  Gradient clipping norm. Gradients with global L2 norm above this value are scaled down. Default: `1.0`.
+
+  ```bash
+  --max-grad-norm 1.0
+  ```
+</ParamField>
+
+<ParamField path="--grad-accum" type="integer">
+  Number of gradient accumulation steps before a parameter update. Effective batch size is `grad_accum × 1` (one sequence per step). Default: `1`.
+
+  ```bash
+  --grad-accum 4
+  ```
+</ParamField>
+
+<ParamField path="--seed" type="integer">
+  Random seed for reproducibility. Default: `42`.
+
+  ```bash
+  --seed 1337
+  ```
+</ParamField>
+
+---
+
+## Checkpointing and logging
+
+<ParamField path="--save-every" type="integer">
+  Save a checkpoint adapter file every N optimizer steps. Default: `100`.
+
+  ```bash
+  --save-every 50
+  ```
+</ParamField>
+
+<ParamField path="--log-every" type="integer">
+  Print a training loss log line every N optimizer steps. Default: `10`.
+
+  ```bash
+  --log-every 5
+  ```
+</ParamField>
+
+---
+
+## Data formats
+
+Training data format is auto-detected from file content. Three formats are supported:
+
+### Plain text (`.txt`)
+
+The entire file is treated as a single sequence for next-token prediction. No special structure required.
+
+```
+The quick brown fox jumps over the lazy dog.
+This is more training text on the next line.
+```
+
+### JSONL — `text` field
+
+Each line is a JSON object with a `"text"` key. ChatML-formatted conversations inside `"text"` are detected automatically.
+
+```jsonl
+{"text": "The quick brown fox jumps over the lazy dog."}
+{"text": "<|im_start|>user\nWhat is the capital of France?<|im_end|>\n<|im_start|>assistant\nThe capital of France is Paris.<|im_end|>"}
+```
+
+### JSONL — `prompt` + `completion` fields
+
+Each line has separate `"prompt"` and `"completion"` keys. The model trains only on the completion — the prompt tokens are masked out during loss computation.
+
+```jsonl
+{"prompt": "What is the capital of France?", "completion": "The capital of France is Paris."}
+{"prompt": "<|im_start|>user\nWrite a haiku.<|im_end|>\n<|im_start|>assistant\n", "completion": "Old pond silent\nA frog leaps into the water\nSplash then stillness<|im_end|>"}
+```
+
+### ChatML auto-detection and prompt masking
+
+When a `"text"` JSONL entry contains a ChatML-formatted conversation (detected by the presence of `<|im_start|>assistant\n`), LLogos automatically masks all tokens before the first `<|im_start|>assistant\n` marker. The model trains only on the assistant completion tokens.
+
+```
+Everything before <|im_start|>assistant\n → masked (loss = 0)
+Everything after  <|im_start|>assistant\n → trained on
+```
+
+This matches the behavior of the `prompt`/`completion` split but requires no separate fields — the structure is inferred from the ChatML markers.
+
+---
+
+## Performance
+
+<Tip>
+  On an RTX 5080 with a Qwen3.5-9B Q8\_0 model, CUDA training runs approximately **30 seconds per epoch** for a typical training set at `--seq-len 512`. CPU training is significantly slower and recommended only for small models or testing.
+</Tip>
+
+| Backend | Model | Epoch time (approx.) |
+|---------|-------|---------------------|
+| CUDA (RTX 5080) | Qwen3.5-9B Q8\_0 | ~30 s |
+| CPU | Qwen3.5-0.8B Q8\_0 | ~minutes |
+
+Training memory use scales with `rank × seq_len`. For a 9B model at rank 8 and seq\_len 512, expect \~2–3 GB additional VRAM above the model weights.
+
+---
+
+## Examples
+
+### Basic LoRA training on CUDA
+
+```bash
+dotnet run --project src/Daisi.Llogos.Cli -- train \
+    --model C:\GGUFS\Qwen3.5-9B-Q8_0.gguf \
+    --data training_data.jsonl \
+    --output adapter.llra \
+    --backend cuda \
+    --rank 8 --alpha 16 \
+    --epochs 3 --lr 1e-4
+```
+
+### Quick training with all flags
+
+```bash
+dotnet run --project src/Daisi.Llogos.Cli -- train \
+    --model C:\GGUFS\Qwen3.5-9B-Q8_0.gguf \
+    --data training_data.jsonl \
+    --output my-adapter.llra \
+    --backend cuda \
+    --rank 16 --alpha 32 \
+    --targets qkvofd \
+    --lr 5e-5 --epochs 5 \
+    --seq-len 1024 \
+    --warmup 100 \
+    --weight-decay 0.01 \
+    --max-grad-norm 1.0 \
+    --grad-accum 4 \
+    --seed 1337 \
+    --save-every 50 \
+    --log-every 5
+```
+
+### Training with DeltaNet targets (Qwen3.5 models)
+
+```bash
+dotnet run --project src/Daisi.Llogos.Cli -- train \
+    --model C:\GGUFS\Qwen3.5-0.8B-Q8_0.gguf \
+    --data training-data.jsonl \
+    --rank 8 --targets qkvod --backend cuda
+```
+
+### Inference with a trained adapter
+
+After training, load the adapter with `--lora`. It is merged into the model weights at load time with zero inference overhead:
+
+```bash
+dotnet run --project src/Daisi.Llogos.Cli -- \
+    --model C:\GGUFS\Qwen3.5-9B-Q8_0.gguf \
+    --lora adapter.llra \
+    --prompt "What did I train you on?" \
+    --backend cuda
+```
+
+### CPU training (small model or testing)
+
+```bash
+dotnet run --project src/Daisi.Llogos.Cli -- train \
+    --model C:\GGUFS\Qwen3.5-0.8B-Q8_0.gguf \
+    --data training_data.jsonl \
+    --backend cpu \
+    --rank 4 --epochs 1
+```

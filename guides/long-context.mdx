@@ -1,0 +1,142 @@
+---
+title: 'Run models at 200K+ context length on 16 GB GPU'
+description: 'Flash attention, paged KV cache, RAM offloading, and sliding window combine to extend context far beyond what standard attention allows on consumer GPUs.'
+---
+
+The fundamental challenge of long context is that the KV cache grows linearly with the number of tokens. A standard FP32 KV cache for a 9B-parameter model at 200K tokens would consume roughly 4.8 GB — and at 1M tokens, it exceeds available VRAM entirely.
+
+LLogos addresses this through a layered set of techniques: tiled flash attention removes the shared memory ceiling, FP16 KV halves storage cost by default, paged allocation grows the cache on demand, RAM offloading pushes older pages to system memory, and sliding window with attention sinks enables infinite streaming at fixed memory. The Qwen 3.5 hybrid architecture amplifies all of these — only 6 of its 28 layers use standard KV cache, which reduces cache growth by roughly 4× compared to a pure-attention model of the same depth.
+
+## Flash attention with online softmax
+
+Standard attention kernels allocate `shared[seqLen]` for attention scores. Beyond roughly 12K tokens on most GPUs, this exceeds the per-block shared memory limit (48–100 KB) and crashes the kernel.
+
+LLogos uses tiled attention: the context is processed in chunks of T positions (e.g., T=1024). Each tile computes a partial softmax, and tiles are merged using the online log-sum-exp correction:
+
+```
+For each tile:
+  1. scores[t] = q @ K_tile^T × scale       (T scores in shared memory, not S)
+  2. tile_max  = max(scores[0..T-1])
+  3. tile_sum  = sum(exp(scores - tile_max))
+  4. tile_out  = softmax(scores) @ V_tile
+  5. Merge: rescale previous output by exp(prev_max - new_max), combine sums
+```
+
+Shared memory usage is O(T + blockDim) — constant regardless of context length. There is no upper limit on sequence length imposed by shared memory.
+
+## FP16 KV cache (default)
+
+LLogos stores the KV cache in FP16 by default, halving memory vs FP32 with negligible quality impact. Modern GPUs have native FP16 load and convert instructions, so dequantization during attention score computation is essentially free.
+
+```
+KV cache sizes per context (Qwen 3.5 0.8B, 6 attention layers):
+
+Context   FP32       FP16
+------    ------     ------
+32K       192 MB     96 MB
+200K      1.2 GB     600 MB
+1M        6 GB       3 GB
+```
+
+No flags are needed — FP16 is the default. To combine with other strategies, simply add the relevant flags below.
+
+## Paged KV cache
+
+Standard KV cache pre-allocates the full maximum context upfront. With `--paged`, LLogos switches to a page table of fixed 256-token blocks that grows dynamically as the sequence length increases:
+
+```bash
+dotnet run --project src/Daisi.Llogos.Cli -- \
+    --model C:\GGUFS\Qwen3.5-9B-Q8_0.gguf \
+    --prompt "Hello" --backend cuda \
+    --paged
+```
+
+Benefits:
+- Short prompts consume only the pages actually used
+- Pages can live in different memory tiers (VRAM, RAM)
+- No memory fragmentation — all pages are the same size
+
+## RAM offloading
+
+`--offload-pages` keeps only the most recent pages in VRAM, and streams older pages from pinned system RAM on demand:
+
+```bash
+dotnet run --project src/Daisi.Llogos.Cli -- \
+    --model C:\GGUFS\Qwen3.5-9B-Q8_0.gguf \
+    --prompt "Hello" --backend cuda \
+    --paged --offload-pages
+```
+
+Attention over offloaded pages uses the same online softmax tiling as flash attention: hot pages are attended at full VRAM speed, warm pages are streamed in chunks, and partial results are merged incrementally. Only 384 MB of VRAM is needed to hold hot pages for a 1M-token context.
+
+<Note>
+  VRAM bandwidth on an RTX 5080 is 960 GB/s. System DDR5 RAM bandwidth is approximately 80 GB/s — roughly 12× slower. Offloading is effective when the model fits comfortably in VRAM and the bottleneck shifts to KV cache reads at long context. For very long contexts where most tokens are in RAM, expect a decode throughput reduction proportional to the fraction of pages streamed from system memory.
+</Note>
+
+Memory comparison at various context lengths with RAM offloading enabled:
+
+| Context | FP16 (VRAM only) | FP16 + RAM offload (VRAM) |
+|---------|----------------:|-------------------------:|
+| 200K    | 2.4 GB          | 384 MB                   |
+| 1M      | 12 GB           | 384 MB                   |
+| 10M     | 120 GB          | 384 MB + ~12 GB RAM      |
+
+## Sliding window with attention sinks
+
+For truly unbounded streaming context, `--attention sinks:64,4096` enables a fixed-size rolling window with attention sink retention:
+
+```bash
+dotnet run --project src/Daisi.Llogos.Cli -- \
+    --model C:\GGUFS\Qwen3.5-0.8B-Q8_0.gguf \
+    --prompt "Hello, world" \
+    --attention sinks:64,4096
+```
+
+The format is `sinks:<sink_tokens>,<window_size>`. In the example above, the first 64 tokens are kept as attention sinks and the most recent 4096 tokens form the sliding window. Total cache size is fixed at 4160 token positions — memory and decode throughput remain constant regardless of how much text the model generates.
+
+Attention sinks work because initial tokens receive disproportionately high attention weights across all layers. Evicting them degrades generation quality; keeping only the most recent tokens without sinks causes output degradation. The `sinks:` prefix retains them alongside the window.
+
+| Mode | Memory | Throughput | Context quality |
+|------|--------|-----------|-----------------|
+| Full KV | Grows linearly | Slows at long context | Full recall |
+| Paged + offload | VRAM-bounded | Slows during RAM reads | Full recall |
+| Sliding window | Fixed | Constant | Recent + sinks only |
+
+## LLogos Turbo KV compression
+
+`--kv-quant turbo:3` compresses the KV cache 8–12× via Walsh-Hadamard rotation, MSE-optimal scalar quantization, and QJL sign-bit residual correction:
+
+```bash
+dotnet run --project src/Daisi.Llogos.Cli -- \
+    --model C:\GGUFS\Qwen3.5-9B-Q8_0.gguf \
+    --prompt "Hello" --backend cuda \
+    --kv-quant turbo:3
+```
+
+This can be combined with sliding window and other strategies:
+
+```bash
+dotnet run --project src/Daisi.Llogos.Cli -- \
+    --model C:\GGUFS\Qwen3.5-9B-Q8_0.gguf \
+    --prompt "Hello" --backend cuda \
+    --kv-quant turbo:3 --attention sinks:64,4096
+```
+
+For architecture details, benchmarks, and configuration options, see [LLogos Turbo](/optimization/llogos-turbo).
+
+## Qwen 3.5 hybrid architecture advantage
+
+Qwen 3.5's hybrid DeltaNet architecture directly reduces KV cache pressure. Out of 28 total layers, only 6 use standard softmax attention and require a KV cache. The remaining 22 layers use DeltaNet — a recurrent linear attention variant with O(1) per-token memory that maintains a fixed-size state matrix regardless of context length.
+
+| Component | Memory cost |
+|-----------|------------|
+| Standard attention KV cache (per layer) | `2 × seq_len × kv_heads × head_dim × sizeof(dtype)` — grows linearly |
+| DeltaNet state (per layer) | `heads × head_dim × head_dim × 4 bytes` — fixed at ~1 MB |
+
+At 32K context with FP16 KV, a 24-layer pure-attention model would need 64 MB × 24 = **1.5 GB** for KV cache. Qwen 3.5 with the same context needs 64 MB × 6 = **384 MB** — a 4× reduction that makes 200K+ context feasible on 16 GB GPUs.
+
+The KV cache cost calculation for Qwen 3.5 0.8B (FP16, 8 KV heads, 64 head dim):
+```
+Per layer per position: 8 KV heads × 64 dim × 2 bytes × 2 (K+V) = 2 KB
+At 32K context, 6 layers: 2 KB × 32,768 × 6 = 384 MB
+```

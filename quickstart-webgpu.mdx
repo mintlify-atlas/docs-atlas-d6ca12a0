@@ -1,0 +1,192 @@
+---
+title: 'Run LLogos in the browser or in Node.js with WebGPU'
+description: 'Install @daisinet/llogos-webgpu, build from source, run 72 automated GPU tests, and stream tokens from a GGUF model in the browser or Node.js.'
+---
+
+`@daisinet/llogos-webgpu` is the TypeScript engine that brings LLogos to the browser and Node.js. It loads GGUF models over HTTP, compiles 20+ WGSL compute shaders at runtime, and streams generated tokens using the same async iterator API as the .NET engine. No native binaries, no Python, no server required — the entire inference pipeline runs on the GPU through the WebGPU API.
+
+The package runs in Chrome 113+, Edge 113+, and Node.js via Dawn WebGPU bindings. It has been tested on Android with Adreno and Mali GPUs through the browser.
+
+## Prerequisites
+
+- Node.js 18 or later
+- npm
+- A WebGPU-capable GPU (any modern discrete or integrated GPU)
+- For tests: Dawn WebGPU Node bindings (installed automatically by `npm install`)
+
+<Steps>
+
+<Step title="Install dependencies">
+
+Navigate into the WebGPU source directory and install:
+
+```bash
+cd src/webgpu
+npm install
+```
+
+This installs TypeScript, esbuild, vitest, and the `webgpu` Dawn bindings package that enables GPU inference in Node.js tests.
+</Step>
+
+<Step title="Build the package">
+
+```bash
+npm run build
+```
+
+esbuild bundles the TypeScript source into `dist/index.js` and `dist/index.d.ts`. The WGSL shader sources are inlined into the bundle as template strings at build time.
+</Step>
+
+<Step title="Run the test suite">
+
+```bash
+npm test
+```
+
+This runs 72 automated tests via vitest, including full GPU inference tests executed through Dawn WebGPU. The suite covers GGUF parsing, tokenization, quantized matrix multiply (Q4_0, Q8_0, F32), attention, RMSNorm, RoPE, DeltaNet state updates, and end-to-end generation.
+
+```
+✓ gguf/parser (14 tests)
+✓ tokenizer/bpe (11 tests)
+✓ gpu/matmul (8 tests)
+✓ gpu/attention (9 tests)
+✓ gpu/deltanet (6 tests)
+✓ model/qwen35 (7 tests)
+...
+72 tests passed
+```
+
+To run only the benchmark:
+
+```bash
+npx vitest run test/benchmark.test.ts
+```
+</Step>
+
+<Step title="Write your first inference script">
+
+Import the engine, initialize the GPU, load a model, and iterate over the token stream:
+
+```typescript
+import { LlogosEngine } from '@daisinet/llogos-webgpu';
+
+const engine = new LlogosEngine();
+await engine.initGpu();
+await engine.loadModel('https://huggingface.co/.../model.gguf');
+
+for await (const token of engine.generate('Hello, world')) {
+  process.stdout.write(token);
+}
+```
+
+`initGpu()` requests a WebGPU device and compiles all WGSL shaders. `loadModel()` fetches the GGUF file over HTTP, caches it in the browser Cache API (browser) or memory (Node.js), and uploads quantized weights to the GPU. `generate()` returns an async iterable that yields decoded string tokens one at a time.
+
+<Tabs>
+  <Tab title="Browser">
+In the browser, use the same API inside a standard ES module script. WebGPU is available in Chrome 113+ and Edge 113+ without any flags.
+
+```html
+<script type="module">
+  import { LlogosEngine } from '/dist/index.js';
+
+  const engine = new LlogosEngine();
+  await engine.initGpu();
+
+  // loadModel caches the GGUF file in the browser Cache API on first load.
+  // Subsequent loads are served from cache — no re-download needed.
+  await engine.loadModel('https://huggingface.co/.../model.gguf');
+
+  const output = document.getElementById('output');
+  for await (const token of engine.generate('Explain WebGPU in one paragraph')) {
+    output.textContent += token;
+  }
+</script>
+```
+
+**Browser requirements:**
+- Chrome 113+ or Edge 113+ (WebGPU enabled by default)
+- Served over HTTPS or `localhost` (WebGPU is blocked on plain HTTP origins)
+- The model URL must be CORS-accessible
+
+The browser Cache API persists the downloaded GGUF across page reloads. A 1.6 GB model downloads once and is served from cache on every subsequent visit.
+  </Tab>
+  <Tab title="Node.js">
+In Node.js, the `webgpu` package provides Dawn bindings that expose the same `navigator.gpu` API. The test suite uses this path.
+
+```typescript
+// The webgpu package sets up navigator.gpu via Dawn before you import LlogosEngine
+import 'webgpu';
+import { LlogosEngine } from '@daisinet/llogos-webgpu';
+
+const engine = new LlogosEngine();
+await engine.initGpu();
+await engine.loadModel('https://huggingface.co/.../model.gguf');
+
+for await (const token of engine.generate('Hello, world')) {
+  process.stdout.write(token);
+}
+
+process.stdout.write('\n');
+```
+
+Node.js does not have a Cache API, so `loadModel()` fetches from the URL on every run. For local development, pass a `file://` URL or a path to a locally downloaded GGUF file.
+
+**Node.js requirements:**
+- Node.js 18+
+- `webgpu` npm package (Dawn bindings, installed by `npm install`)
+- A GPU accessible to Dawn (NVIDIA, AMD, or Intel on Windows/Linux)
+
+</Tab>
+</Tabs>
+</Step>
+
+</Steps>
+
+## WebGPU benchmarks
+
+Measured via Dawn in Node.js on an NVIDIA RTX 5090 (Blackwell), 32 decode tokens:
+
+| Model | Prefill | Decode | VRAM |
+|-------|---------|--------|------|
+| TinyLlama 1.1B Q8_0 | 45 tok/s | — | 1570 MB |
+| Llama 3.2 1B Q8_0 | 61 tok/s | 54 tok/s | 2787 MB |
+| Qwen 2.5 0.5B Q8_0 | 42 tok/s | 37 tok/s | 1592 MB |
+| Qwen 3.5 0.8B Q8_0 | 17 tok/s | 17 tok/s | 1592 MB |
+
+Qwen 3.5's lower throughput reflects the DeltaNet hybrid architecture: each layer alternates between a standard attention pass and a DeltaNet state-space step, which requires 6 custom WGSL shaders for the recurrent state computation. Both paths run entirely on the GPU with zero CPU readbacks.
+
+## WGSL shaders and DeltaNet
+
+The engine ships with 20+ WGSL compute shaders covering:
+
+- Matrix multiply for F32, Q4_0, and Q8_0 quantization formats
+- Multi-head attention with GQA (grouped-query attention)
+- RMSNorm, RoPE positional encoding, SwiGLU activation, embedding lookup
+- 6 DeltaNet-specific shaders: causal conv1d, L2 normalization, decay/beta computation, state update, SiLU gate
+
+DeltaNet runs the full state-space computation on the GPU. There are no CPU-side intermediate buffers and no GPU→CPU readbacks during the forward pass.
+
+## Source layout
+
+```
+src/webgpu/src/
+├── engine.ts          LlogosEngine class — public API
+├── index.ts           Package exports
+├── gguf/              GGUF v2/v3 parser (TypeScript)
+├── gpu/               WebGPU device management and shader compilation
+├── model/             Architecture-specific forward pass (LLaMA, Qwen 2/2.5, Qwen 3.5)
+├── tokenizer/         BPE tokenizer from GGUF metadata
+├── storage/           HTTP fetch + Cache API model loading
+└── worker/            Web Worker wrapper for off-main-thread inference
+```
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="WebGPU backend reference" icon="gpu" href="/reference/backends/webgpu">
+    WGSL shader inventory, quantization formats, and DeltaNet GPU implementation details.
+  </Card>
+  <Card title="Qwen 3.5 architecture" icon="diagram-project" href="/reference/architectures/qwen35">
+    How the hybrid DeltaNet + standard attention architecture is implemented end to end.
+  </Card>
+</CardGroup>

@@ -1,0 +1,263 @@
+---
+title: "GGUF model format — binary layout and parsing"
+description: "The GGUF binary format: header structure, metadata KV pairs, tensor info descriptors, alignment, quantization block layouts, and GgufFile.Read() usage."
+keywords: ["GGUF", "binary format", "quantization", "GgmlType", "tensor info", "metadata", "parser", "GgufFile"]
+---
+
+GGUF (GGPT Unified Format) is the binary container format used to distribute quantized language model weights. It stores all model configuration — architecture, vocabulary, hyperparameters — as typed metadata key-value pairs in the same file as the weight tensors. LLogos supports GGUF versions 2 and 3.
+
+## Key properties
+
+- **Self-describing** — All model configuration (architecture, dimensions, vocabulary) is embedded as metadata KV pairs. No sidecar files are needed.
+- **Little-endian** — All multi-byte values are stored little-endian.
+- **Alignment-aware** — The tensor data section starts at a configurable alignment boundary (default 32 bytes).
+- **Lazy-loadable** — The header and metadata can be read without loading the (large) tensor data section. LLogos uses this to inspect a model without allocating GPU memory.
+
+## Binary layout
+
+The file is divided into four sequential sections:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  Header (24 bytes, fixed)                                    │
+│  Magic (4B) | Version (4B) | Tensor Count (8B) | KV Count (8B) │
+├─────────────────────────────────────────────────────────────┤
+│  Metadata KV Section (variable)                              │
+│  One encoded KV pair per metadata count                      │
+├─────────────────────────────────────────────────────────────┤
+│  Tensor Info Section (variable)                              │
+│  One descriptor per tensor count                             │
+├─────────────────────────────────────────────────────────────┤
+│  Alignment Padding (0 to alignment−1 zero bytes)            │
+├─────────────────────────────────────────────────────────────┤
+│  Tensor Data Section (bulk of file)                          │
+│  Raw quantized weight bytes, tensors stored contiguously     │
+└─────────────────────────────────────────────────────────────┘
+```
+
+## Header structure
+
+The header is exactly 24 bytes:
+
+| Offset | Size | Type | Field | Description |
+|--------|------|------|-------|-------------|
+| 0 | 4 | uint32 | Magic | Must be `0x46554747` (ASCII `GGUF`) |
+| 4 | 4 | uint32 | Version | File format version (2 or 3) |
+| 8 | 8 | uint64 | Tensor count | Number of tensor info descriptors |
+| 16 | 8 | uint64 | Metadata KV count | Number of metadata KV pairs |
+
+LLogos validates the magic on every open and throws `InvalidDataException` if it does not match. Versions 1 and 4+ throw `NotSupportedException`.
+
+## Metadata KV pairs
+
+Each metadata KV pair encodes a key (UTF-8 string) followed by a typed value:
+
+```
+Key length   uint64
+Key bytes    UTF-8
+Value type   uint32
+Value data   (type-dependent, see table below)
+```
+
+### Value types
+
+| Type ID | Name | Encoding |
+|---------|------|----------|
+| 0 | Uint8 | 1 byte |
+| 1 | Int8 | 1 byte |
+| 2 | Uint16 | 2 bytes LE |
+| 3 | Int16 | 2 bytes LE |
+| 4 | Uint32 | 4 bytes LE |
+| 5 | Int32 | 4 bytes LE |
+| 6 | Float32 | 4 bytes LE (IEEE 754) |
+| 7 | Bool | 1 byte (0 = false, nonzero = true) |
+| 8 | String | uint64 length + UTF-8 bytes |
+| 9 | Array | uint32 element type + uint64 count + N encoded elements |
+| 10 | Uint64 | 8 bytes LE |
+| 11 | Int64 | 8 bytes LE |
+| 12 | Float64 | 8 bytes LE (IEEE 754) |
+
+<Note>
+In GGUF v2 and v3, all string lengths are encoded as `uint64` (not `uint32` as in v1). LLogos always reads string lengths as 8 bytes.
+</Note>
+
+### Common metadata keys
+
+| Key | Type | Example | Purpose |
+|-----|------|---------|---------|
+| `general.architecture` | String | `"qwen3"` | Model architecture family |
+| `general.name` | String | `"Qwen3.5-0.8B"` | Human-readable model name |
+| `general.alignment` | Uint32 | `32` | Tensor data alignment in bytes |
+| `{arch}.context_length` | Uint32 | `32768` | Maximum context window |
+| `{arch}.embedding_length` | Uint32 | `1024` | Hidden dimension size |
+| `{arch}.block_count` | Uint32 | `28` | Number of transformer layers |
+| `{arch}.attention.head_count` | Uint32 | `16` | Number of query heads |
+| `{arch}.attention.head_count_kv` | Uint32 | `8` | Number of KV heads (GQA) |
+| `{arch}.rope.freq_base` | Float32 | `1000000.0` | RoPE frequency base (theta) |
+| `tokenizer.ggml.model` | String | `"gpt2"` | Tokenizer type (BPE variant) |
+| `tokenizer.ggml.tokens` | Array[String] | `["<\|endoftext\|>", ...]` | Vocabulary tokens |
+| `tokenizer.ggml.merges` | Array[String] | `["a b", ...]` | BPE merge rules |
+
+## Tensor info descriptors
+
+Each tensor is described by a fixed-format descriptor before the tensor data section begins:
+
+```
+Name length    uint64
+Name bytes     UTF-8   (e.g., "blk.0.attn_q.weight")
+N dimensions   uint32
+Dimensions     uint64 × N
+GgmlType       uint32
+Offset         uint64  (relative to start of tensor data section)
+```
+
+| Field | Description |
+|-------|-------------|
+| Name | Hierarchical dot-separated name identifying the tensor's role |
+| Dimensions | Shape of the tensor (1–4 dimensions typical) |
+| GgmlType | Quantization format enum (see type size reference below) |
+| Offset | Byte offset within the tensor data section |
+
+LLogos computes `ElementCount` as the product of all dimensions and `ByteSize` as `(elementCount / blockSize) * typeSize`.
+
+### Tensor naming convention
+
+```
+token_embd.weight              — Token embedding matrix
+blk.{N}.attn_q.weight          — Layer N query projection
+blk.{N}.attn_k.weight          — Layer N key projection
+blk.{N}.attn_v.weight          — Layer N value projection
+blk.{N}.attn_output.weight     — Layer N attention output projection
+blk.{N}.attn_norm.weight       — Layer N pre-attention RMSNorm
+blk.{N}.ffn_gate.weight        — Layer N SwiGLU gate projection
+blk.{N}.ffn_up.weight          — Layer N SwiGLU up projection
+blk.{N}.ffn_down.weight        — Layer N SwiGLU down projection
+blk.{N}.ffn_norm.weight        — Layer N pre-FFN RMSNorm
+output_norm.weight             — Final RMSNorm
+output.weight                  — Language model head (logit projection)
+```
+
+## Alignment and padding
+
+The tensor data section must start at a byte offset that is a multiple of the alignment value. LLogos computes this as:
+
+```
+tensor_data_offset = align_up(end_of_tensor_info_section, alignment)
+```
+
+The alignment is read from the `general.alignment` metadata key (default: 32). Bytes between the end of the tensor info section and the aligned start are zero-padded.
+
+Individual tensor offsets stored in each descriptor are relative to the start of the tensor data section:
+
+```
+absolute_tensor_offset = tensor_data_offset + tensor_info.offset
+```
+
+`GgufFile.Read()` computes and stores `tensor_data_offset` once during parsing. `ReadTensorData()` then seeks directly to any tensor's data on demand without re-scanning the file.
+
+## Reading a GGUF file
+
+```csharp
+using var stream = File.OpenRead("model.gguf");
+var gguf = GgufFile.Read(stream);
+
+// Inspect metadata
+string arch = (string)gguf.Metadata["general.architecture"];
+int layers = (int)(uint)gguf.Metadata["qwen3.block_count"];
+
+// Iterate tensor descriptors (no weights loaded yet)
+foreach (var info in gguf.TensorInfos)
+    Console.WriteLine($"{info.Name}: {info.Type} {string.Join("×", info.Dimensions)}");
+
+// Load a specific tensor's raw bytes
+ReadOnlySpan<byte> data = gguf.ReadTensorData(stream, info);
+```
+
+## Dequantization block layouts
+
+LLogos backends dequantize weights on the fly during matrix multiply operations. The three most common formats are:
+
+<Tabs>
+  <Tab title="Q8_0">
+    **34 bytes per block of 32 elements.**
+
+    ```
+    ┌─────────────────────┬────────────────────────────────────────┐
+    │   Scale (FP16)      │     32 × int8 quantized weights        │
+    │     2 bytes         │            32 bytes                    │
+    └─────────────────────┴────────────────────────────────────────┘
+    ```
+
+    ```csharp
+    float scale = (float)BitConverter.ToHalf(block, 0);
+    for (int i = 0; i < 32; i++)
+        output[i] = scale * (sbyte)block[2 + i];
+    ```
+  </Tab>
+  <Tab title="Q4_0">
+    **18 bytes per block of 32 elements.**
+
+    ```
+    ┌─────────────────────┬────────────────────────────────────────┐
+    │   Scale (FP16)      │   16 bytes (32 × 4-bit nibbles)        │
+    │     2 bytes         │   low nibble = even index              │
+    │                     │   high nibble = odd index              │
+    └─────────────────────┴────────────────────────────────────────┘
+    ```
+
+    ```csharp
+    float scale = (float)BitConverter.ToHalf(block, 0);
+    for (int i = 0; i < 16; i++)
+    {
+        byte packed = block[2 + i];
+        int lo = (packed & 0x0F) - 8;
+        int hi = (packed >> 4) - 8;
+        output[2 * i]     = scale * lo;
+        output[2 * i + 1] = scale * hi;
+    }
+    ```
+  </Tab>
+  <Tab title="Q4_K">
+    **144 bytes per super-block of 256 elements (8 sub-blocks of 32).**
+
+    ```
+    ┌──────────┬──────────┬──────────────────────┬──────────────────────────┐
+    │ d (FP16) │dmin(FP16)│  Scales/Mins          │  Quantized weights       │
+    │  2 bytes │  2 bytes │  12 bytes              │  128 bytes               │
+    │          │          │  (8 × 6-bit scale      │  (256 × 4-bit nibbles)   │
+    │          │          │   + 8 × 6-bit min)     │                          │
+    └──────────┴──────────┴──────────────────────┴──────────────────────────┘
+    ```
+
+    ```csharp
+    // Per sub-block j (0..7):
+    float sub_scale = d * scales[j];
+    float sub_min   = dmin * mins[j];
+    for (int i = 0; i < 32; i++)
+        output[j * 32 + i] = sub_scale * nibble[j * 32 + i] - sub_min;
+    ```
+
+    The 6-bit scales and mins are packed into the 12-byte scales section using a non-trivial bit layout: the lower 4 bits of each value occupy the first 8 bytes; the upper 2 bits are packed into the remaining 4 bytes.
+  </Tab>
+</Tabs>
+
+## Type size reference
+
+| GgmlType | Block size (elements) | Type size (bytes) | Bits/weight |
+|----------|-----------------------|-------------------|-------------|
+| F32 | 1 | 4 | 32.0 |
+| F16 | 1 | 2 | 16.0 |
+| Q8_0 | 32 | 34 | 8.5 |
+| Q4_0 | 32 | 18 | 4.5 |
+| Q4_1 | 32 | 20 | 5.0 |
+| Q5_0 | 32 | 22 | 5.5 |
+| Q5_1 | 32 | 24 | 6.0 |
+| Q4_K | 256 | 144 | 4.5 |
+| Q5_K | 256 | 176 | 5.5 |
+| Q6_K | 256 | 210 | 6.5625 |
+| Q2_K | 256 | 84 | 2.625 |
+| Q3_K | 256 | 110 | 3.4375 |
+
+<Tip>
+Q8_0 is the recommended format for integration testing because it has simple dequantization logic and near-lossless quality. Q4_K is the recommended deployment format — it achieves 4.5 bits/weight with better accuracy than plain Q4_0 due to its sub-block scaling structure.
+</Tip>

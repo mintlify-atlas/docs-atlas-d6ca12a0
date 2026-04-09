@@ -1,0 +1,429 @@
+---
+title: "LLogos CLI — inference flags and options reference"
+description: "Complete reference for daisi-llogos inference flags: model loading, backend selection, sampling, KV cache strategies, and speculative decoding."
+---
+
+The LLogos CLI (Daisi.Llogos.Cli) provides full control over model loading, backend selection, generation parameters, KV cache strategies, and benchmarking from the command line.
+
+## Usage
+
+```bash
+daisi-llogos --model <path> --prompt <text> [options]
+daisi-llogos --model <path> --bench [options]
+daisi-llogos split --model <path> [options]
+```
+
+`--model` and `--prompt` are required for generation. For benchmarking, `--prompt` is optional and defaults to `"The meaning of life is"`.
+
+---
+
+## Core flags
+
+<ParamField path="--model" type="string" required>
+  Path to the GGUF model file. Required for all operations. Short form: `-m`.
+
+  ```bash
+  --model C:\GGUFS\Qwen3.5-0.8B-Q8_0.gguf
+  ```
+</ParamField>
+
+<ParamField path="--prompt" type="string">
+  Input text for generation. Required unless `--bench` is set. Short form: `-p`.
+
+  ```bash
+  --prompt "Explain quantum entanglement"
+  ```
+</ParamField>
+
+<ParamField path="--backend" type="string">
+  Compute backend to use. Options: `cpu` (default), `cuda`, `vulkan`. Short form: `-b`.
+
+  - `cpu` — AVX2/AVX-512 SIMD, multi-threaded. Works everywhere.
+  - `cuda` — NVIDIA GPU via NVRTC JIT kernels. Fastest option.
+  - `vulkan` — Any GPU (NVIDIA/AMD/Intel) via SPIR-V shaders.
+
+  ```bash
+  --backend cuda
+  ```
+</ParamField>
+
+<ParamField path="--bench" type="boolean">
+  Run a benchmark instead of interactive generation. Measures and reports separate prefill and decode throughput (tok/s). If `--prompt` is omitted, uses `"The meaning of life is"` as the prompt.
+
+  ```bash
+  --bench --backend cuda
+  ```
+</ParamField>
+
+<ParamField path="--help" type="boolean">
+  Print usage information and exit. Short form: `-h`.
+</ParamField>
+
+---
+
+## Generation parameters
+
+<ParamField path="--max-tokens" type="integer">
+  Maximum number of tokens to generate. Default: `256`. Short form: `-n`.
+
+  ```bash
+  --max-tokens 512
+  ```
+</ParamField>
+
+<ParamField path="--max-context" type="integer">
+  Maximum context length (KV cache capacity) in tokens. Default: `2048`. Overridden by attention strategy when using `sinks` or `window` modes.
+
+  ```bash
+  --max-context 8192
+  ```
+</ParamField>
+
+<ParamField path="--temperature" type="float">
+  Sampling temperature. `0` selects the highest-probability token (greedy). Default: `0.7`. Short form: `-t`.
+
+  ```bash
+  --temperature 0.0
+  ```
+</ParamField>
+
+<ParamField path="--top-k" type="integer">
+  Top-k sampling. Only the top `k` tokens are considered. `0` disables top-k. Default: `40`.
+
+  ```bash
+  --top-k 50
+  ```
+</ParamField>
+
+<ParamField path="--top-p" type="float">
+  Nucleus (top-p) sampling threshold. Tokens are sampled from the smallest set whose cumulative probability meets `p`. Default: `0.9`.
+
+  ```bash
+  --top-p 0.95
+  ```
+</ParamField>
+
+<ParamField path="--repeat-penalty" type="float">
+  Repetition penalty applied to previously generated tokens. `1.0` disables it. Default: `1.1`.
+
+  ```bash
+  --repeat-penalty 1.2
+  ```
+</ParamField>
+
+<ParamField path="--seed" type="integer">
+  Random seed for reproducible generation. When omitted, sampling is non-deterministic.
+
+  ```bash
+  --seed 42
+  ```
+</ParamField>
+
+---
+
+## Model loading
+
+<ParamField path="--no-mmap" type="boolean">
+  Disable memory-mapped file loading and use stream loading instead. By default, LLogos uses `mmap` (zero-copy, maps the GGUF file directly into the process address space). Use `--no-mmap` when mmap is unavailable or undesirable.
+
+  <Note>
+    LoRA adapters always force stream loading on CPU first, then upload to GPU. `--no-mmap` has no additional effect in that case.
+  </Note>
+</ParamField>
+
+<ParamField path="--lora" type="string">
+  Path to a LoRA adapter file (`.llra` format). The adapter is merged into the model weights at load time with zero inference overhead. Can be specified multiple times to stack adapters.
+
+  ```bash
+  --lora adapter.llra
+  --lora adapter1.llra --lora adapter2.llra
+  ```
+</ParamField>
+
+---
+
+## Backend and compute
+
+<ParamField path="--hybrid-layers" type="integer">
+  Split inference between GPU and CPU: the first N layers run on the GPU, the remaining layers run on CPU. Only applies when `--backend cuda` is set. Useful when the full model does not fit in VRAM.
+
+  Only ~20 KB of hidden state is transferred at each GPU/CPU boundary, so the overhead is minimal.
+
+  ```bash
+  --backend cuda --hybrid-layers 24
+  ```
+</ParamField>
+
+<ParamField path="--pipeline" type="boolean">
+  Enable pipelined layer streaming for models larger than available VRAM. Instead of loading all weights up front, weight shards are streamed from disk one layer at a time. Requires a shard directory created by the `split` subcommand.
+
+  ```bash
+  --pipeline --backend cuda --model large-model.gguf
+  ```
+
+  <Warning>
+    The shard directory `{model}.shards/` must exist before using `--pipeline`. Create it with `daisi-llogos split --model <path> --align-gpu`.
+  </Warning>
+</ParamField>
+
+<ParamField path="--vocab-limit" type="integer">
+  Vocab divisor for the greedy argmax on the lm\_head. `1` = full vocabulary (default if flag omitted). `32` = top ~3% of tokens (~4,752 of 152K for Qwen models), which speeds up logit computation significantly with identical greedy output for most models.
+
+  Disabled automatically when using `--draft` or `--pipeline`.
+
+  ```bash
+  --vocab-limit 1   # full vocab (default — same as omitting the flag)
+  --vocab-limit 32  # fast partial vocab (~3% of tokens)
+  ```
+</ParamField>
+
+---
+
+## KV cache strategies
+
+<ParamField path="--attention" type="string">
+  Attention strategy controlling KV cache behavior. Default: `full`.
+
+  | Mode | Syntax | Description |
+  |------|--------|-------------|
+  | `full` | `--attention full` | Standard full-context KV cache. |
+  | `window` | `--attention window:N` | Sliding window — only the last N tokens are retained. Fixed memory. |
+  | `sinks` | `--attention sinks:S,W` | Attention sinks — retain S sink tokens + sliding window of W tokens. Fixed memory, supports infinite context streaming. |
+
+  ```bash
+  --attention sinks:64,4096
+  --attention window:2048
+  ```
+</ParamField>
+
+<ParamField path="--paged" type="boolean">
+  Enable paged KV cache with dynamic block allocation. Memory grows with context length rather than being pre-allocated to `--max-context` at load time.
+</ParamField>
+
+<ParamField path="--offload-pages" type="integer">
+  Enable RAM offloading for the paged KV cache. The first N pages are kept in VRAM; remaining pages are offloaded to system RAM. Automatically implies `--paged`.
+
+  ```bash
+  --offload-pages 512
+  ```
+</ParamField>
+
+<ParamField path="--kv-quant" type="string">
+  KV cache compression via LLogos Turbo (Walsh-Hadamard rotation + scalar quantization + optional QJL correction). Achieves 8–12× memory reduction.
+
+  | Mode | Description |
+  |------|-------------|
+  | `turbo` | Default Turbo compression. |
+  | `turbo:3` | 3-bit quantization. |
+  | `turbo:4` | 4-bit quantization. |
+  | `turbo:3+qjl32` | 3-bit + QJL correction with 32-dim projection. |
+  | `turbo:3+noqjl` | 3-bit, QJL disabled. |
+
+  ```bash
+  --kv-quant turbo:3
+  --kv-quant turbo:4
+  ```
+</ParamField>
+
+---
+
+## Speculative decoding
+
+<ParamField path="--draft" type="string">
+  Path to a smaller draft model for speculative decoding. The draft model generates candidate tokens that the main model verifies in a single forward pass, increasing effective decode throughput. Both models must be from the same family (e.g. Qwen3.5-0.8B drafting for Qwen3.5-9B).
+</ParamField>
+
+<ParamField path="--spec-depth" type="integer">
+  Number of tokens the draft model speculates per step. Default: `5`.
+
+  ```bash
+  --draft Qwen3.5-0.8B-Q8_0.gguf --spec-depth 5
+  ```
+</ParamField>
+
+<ParamField path="--batched-verify" type="boolean">
+  Use batched verification for speculative decoding. Faster acceptance rate but produces slightly different floating-point results compared to sequential native verification.
+</ParamField>
+
+---
+
+## Diagnostics
+
+<ParamField path="--profile-early-exit" type="boolean">
+  Profile at which transformer layer the final token prediction first stabilizes. Prints a per-layer table showing the token predicted by each layer and marks where it matches the final output. Useful for exploring early-exit / speculative layer-skipping strategies.
+</ParamField>
+
+---
+
+## Grammar-constrained generation
+
+<Note>
+  Grammar-constrained generation via `--grammar` is described in the README and supported by the core GBNF engine, but the `--grammar` flag is not yet wired in the current `ParseArgs` implementation. Pass GBNF grammar strings programmatically via the `GenerationParams` API, or use the bench dashboard for structured output testing.
+</Note>
+
+LLogos includes a pure C# GBNF grammar engine with pre-resolved states and first-character filtering (~99% candidate reduction). Example usage via the README-documented form:
+
+```bash
+dotnet run --project src/Daisi.Llogos.Cli -- \
+    --model C:\GGUFS\Qwen3.5-9B-Q8_0.gguf \
+    --prompt "Output a JSON object"
+```
+
+---
+
+## `split` subcommand
+
+The `split` subcommand pre-processes a GGUF file into per-layer shards for use with `--pipeline`.
+
+```bash
+daisi-llogos split --model <path> [options]
+```
+
+<ParamField path="--model" type="string" required>
+  Path to the GGUF model file to split. Short form: `-m`.
+</ParamField>
+
+<ParamField path="--output-dir" type="string">
+  Output directory for shard files. Default: `{model}.shards/`. Short form: `-o`.
+</ParamField>
+
+<ParamField path="--align-gpu" type="boolean">
+  Pre-repack Q4\_0 and Q8\_0 blocks to GPU-aligned layout (Q8\_0: 34→36 bytes, Q4\_0: 18→20 bytes). Enables faster pipelined inference by avoiding the per-token repacking step.
+
+  ```bash
+  daisi-llogos split --model C:\GGUFS\Qwen3.5-9B-Q8_0.gguf --align-gpu
+  ```
+</ParamField>
+
+---
+
+## Examples
+
+### Basic generation
+
+<Tabs>
+  <Tab title="CPU">
+    ```bash
+    dotnet run --project src/Daisi.Llogos.Cli -- \
+        --model C:\GGUFS\Qwen3.5-0.8B-Q8_0.gguf \
+        --prompt "Hello, world"
+    ```
+  </Tab>
+  <Tab title="CUDA">
+    ```bash
+    dotnet run --project src/Daisi.Llogos.Cli -- \
+        --model C:\GGUFS\Qwen3.5-0.8B-Q8_0.gguf \
+        --prompt "Hello, world" \
+        --backend cuda
+    ```
+  </Tab>
+  <Tab title="Vulkan">
+    ```bash
+    dotnet run --project src/Daisi.Llogos.Cli -- \
+        --model C:\GGUFS\Qwen3.5-0.8B-Q8_0.gguf \
+        --prompt "Hello, world" \
+        --backend vulkan
+    ```
+  </Tab>
+</Tabs>
+
+### Benchmarking
+
+```bash
+dotnet run --project src/Daisi.Llogos.Cli -- \
+    --model C:\GGUFS\Qwen3.5-0.8B-Q8_0.gguf \
+    --bench --backend cuda
+```
+
+Output includes separate prefill and decode tok/s, total time, and model load time.
+
+### Sliding window + attention sinks
+
+Fixed memory usage for long or infinite context streaming. Retains 64 sink tokens and a sliding window of 4096 tokens:
+
+```bash
+dotnet run --project src/Daisi.Llogos.Cli -- \
+    --model C:\GGUFS\Qwen3.5-0.8B-Q8_0.gguf \
+    --prompt "Hello, world" \
+    --attention sinks:64,4096
+```
+
+### Hybrid GPU/CPU inference
+
+Run the first 24 layers on the CUDA GPU, the rest on CPU — useful when the model does not fully fit in VRAM:
+
+```bash
+dotnet run --project src/Daisi.Llogos.Cli -- \
+    --model C:\GGUFS\Qwen3.5-9B-Q8_0.gguf \
+    --backend cuda --hybrid-layers 24 \
+    --prompt "Hello"
+```
+
+### Paged KV cache with RAM offloading
+
+```bash
+dotnet run --project src/Daisi.Llogos.Cli -- \
+    --model C:\GGUFS\Qwen3.5-9B-Q8_0.gguf \
+    --backend cuda \
+    --paged --offload-pages 512 \
+    --prompt "Tell me a very long story"
+```
+
+### Pipelined inference for large models
+
+First, split the model into shards:
+
+```bash
+daisi-llogos split --model C:\GGUFS\Qwen3.5-9B-Q8_0.gguf --align-gpu
+```
+
+Then run with `--pipeline`:
+
+```bash
+dotnet run --project src/Daisi.Llogos.Cli -- \
+    --model C:\GGUFS\Qwen3.5-9B-Q8_0.gguf \
+    --backend cuda --pipeline \
+    --prompt "Hello"
+```
+
+### Inference with a LoRA adapter
+
+```bash
+dotnet run --project src/Daisi.Llogos.Cli -- \
+    --model C:\GGUFS\Qwen3.5-9B-Q8_0.gguf \
+    --lora adapter.llra \
+    --prompt "What did I train you on?" \
+    --backend cuda
+```
+
+### Bonsai 1-bit model
+
+```bash
+dotnet run --project src/Daisi.Llogos.Cli -- \
+    --model C:\GGUFS\Bonsai-8B.gguf \
+    --prompt "Hello" --backend cuda
+```
+
+<Tip>
+  Bonsai-8B uses the Q1\_0\_g128 quantization format (1.1 GB for 8B parameters) and achieves ~90 tok/s decode on CUDA.
+</Tip>
+
+### KV cache compression
+
+```bash
+dotnet run --project src/Daisi.Llogos.Cli -- \
+    --model C:\GGUFS\Qwen3.5-9B-Q8_0.gguf \
+    --backend cuda \
+    --kv-quant turbo:3 \
+    --prompt "Summarize the history of computing"
+```
+
+After generation, LLogos prints compression stats:
+
+```
+[LLogos Turbo KV Cache]
+  Compressed:   142.3 KB
+  Uncompressed: 1138.0 KB
+  Ratio:        8.0x (3.0 bits/dim)
+  Layers: 28, Seq length: 512
+```

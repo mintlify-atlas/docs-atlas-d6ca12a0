@@ -1,0 +1,109 @@
+---
+title: 'Constrain model output with GBNF grammar rules'
+description: 'Force structured output from any GGUF model — JSON, tool calls, custom formats — using a pure C# GBNF grammar engine with no external parser needed.'
+---
+
+LLogos includes a pure C# GBNF grammar engine that constrains model output to match any BNF grammar — without external parser dependencies.
+
+At each decoding step, the grammar engine evaluates which tokens are valid continuations of the current partial output. Only tokens that could lead to a valid parse are included in the candidate set. This forces the model to produce structured text while still using its learned language capabilities — the output is grammatically valid by construction, not by post-processing.
+
+## What is GBNF?
+
+GBNF (GGML BNF) is a BNF grammar dialect used in GGUF-based inference engines. It defines a set of named rules using `::=` notation. Rules can reference each other recursively:
+
+```
+root   ::= "{" ws "\"name\"" ws ":" ws string "}"
+string ::= "\"" [a-zA-Z ]* "\""
+ws     ::= [ \t\n]*
+```
+
+The `root` rule defines the top-level structure the model must produce. Each token generated must keep the partial output in a state where `root` can still be completed.
+
+## Constrain output with --grammar
+
+Pass a GBNF grammar string directly to `--grammar`:
+
+<Note>
+The `--grammar` flag is documented in the README and supported by the core GBNF engine, but is not yet wired into the current CLI `ParseArgs`. Use the GBNF engine programmatically via `GenerationParams` in your own host application.
+</Note>
+
+```bash
+dotnet run --project src/Daisi.Llogos.Cli -- \
+    --model C:\GGUFS\Qwen3.5-9B-Q8_0.gguf \
+    --grammar 'root ::= "{" ws "\"name\"" ws ":" ws string "}"' \
+    --prompt "Output a JSON object"
+```
+
+This produces output like:
+```json
+{"name": "Paris"}
+```
+
+The model cannot produce anything else — the grammar engine rejects any token that would violate the `root` rule.
+
+## JSON schema grammar example
+
+A more complete grammar for a structured response with multiple fields:
+
+```
+root     ::= "{" ws pair ("," ws pair)* ws "}"
+pair     ::= string ws ":" ws value
+value    ::= string | number | "true" | "false" | "null"
+string   ::= "\"" [^\"\\]* "\""
+number   ::= "-"? [0-9]+ ("." [0-9]+)?
+ws       ::= [ \t\n]*
+```
+
+Grammars can encode any context-free language — JSON schemas, XML fragments, S-expressions, domain-specific formats, or custom structured output.
+
+## How the grammar engine works
+
+Grammar states are pre-resolved at load time into terminal sets. Rather than re-parsing the grammar from scratch at every token, the engine pre-computes for each grammar state which terminal characters are valid next characters:
+
+```
+Grammar state:  after "{"  ws
+Valid next chars: '"' (beginning of a key)
+
+Grammar state:  after "\"name\"" ws ":"
+Valid next chars: '"', '-', '0'-'9', 't', 'f', 'n' (beginning of a value)
+```
+
+At each sampling step, the engine applies **first-char filtering**: for each candidate token, it checks whether the first byte of that token is in the valid-next-char set for the current state. Tokens that fail are removed before softmax. This eliminates approximately 99% of vocabulary candidates before any grammar traversal is needed, reducing per-step cost dramatically.
+
+After a token is selected, the grammar state advances by parsing the token's text against the current partial parse, updating the valid-next-char set for the following step.
+
+## Use cases
+
+<AccordionGroup>
+  <Accordion title="JSON output">
+    Constrain any model to produce valid JSON objects, arrays, or specific schemas. Useful for extracting structured information from unstructured text or building APIs that consume model output directly.
+
+    ```bash
+    dotnet run --project src/Daisi.Llogos.Cli -- \
+        --model C:\GGUFS\Qwen3.5-9B-Q8_0.gguf \
+        --grammar 'root ::= "{" ws "\"answer\"" ws ":" ws number "}" ws
+                   number ::= [0-9]+ ("." [0-9]*)?' \
+        --prompt "What is 7 times 8?"
+    ```
+  </Accordion>
+
+  <Accordion title="Tool calling (daisi-minion)">
+    LLogos grammar-constrained generation is used by daisi-minion for reliable tool calling. The tool call grammar enforces that the model outputs a valid function name and argument structure before execution, preventing malformed calls from reaching the tool dispatcher.
+
+    Grammar-constrained sampling ensures that even smaller models can produce syntactically valid tool calls consistently — the grammar handles structural correctness, letting the model focus on choosing the right tool and arguments.
+  </Accordion>
+
+  <Accordion title="Custom structured formats">
+    Any context-free format can be expressed as a GBNF grammar: YAML subsets, CSV rows, Markdown tables, S-expressions, or domain-specific languages. If the format has a grammar, LLogos can constrain the model to it.
+  </Accordion>
+</AccordionGroup>
+
+## Performance characteristics
+
+The grammar engine adds minimal overhead to the standard sampling pipeline:
+
+- **Pre-resolved states** — valid terminal sets are computed once at grammar load, not at every token.
+- **First-char filtering** — approximately 99% of vocabulary candidates are eliminated by checking a single byte before any grammar traversal.
+- **No external dependencies** — the engine is pure C# with no native parser libraries.
+
+For typical JSON grammars on a 150K-token vocabulary, first-char filtering reduces the candidate set from ~150K tokens to roughly a few hundred, making grammar-constrained sampling comparable in cost to unconstrained top-k sampling.

@@ -1,122 +1,102 @@
 {
   "$schema": "https://mintlify.com/docs.json",
-  "theme": "mint",
-  "name": "Mint Starter Kit",
+  "name": "LLogos",
+  "theme": "aspen",
   "colors": {
-    "primary": "#16A34A",
-    "light": "#07C983",
-    "dark": "#15803D"
+    "primary": "#f8c61e",
+    "light": "#fbf9ec",
+    "dark": "#4e412f"
   },
-  "favicon": "/favicon.svg",
+  "favicon": "https://media.brand.dev/aef923c5-713a-4a4c-9df8-656dd3394c51.jpg",
+  "navbar": {
+    "primary": {
+      "type": "github",
+      "href": "https://github.com/daisinet/daisi-llogos"
+    }
+  },
+  "footer": {
+    "socials": {
+      "github": "https://github.com/daisinet/daisi-llogos"
+    }
+  },
   "navigation": {
     "tabs": [
       {
-        "tab": "Guides",
+        "tab": "Documentation",
         "groups": [
           {
-            "group": "Getting started",
+            "group": "Get Started",
             "pages": [
-              "index",
-              "quickstart",
-              "development"
+              "introduction",
+              "quickstart-dotnet",
+              "quickstart-webgpu"
             ]
           },
           {
-            "group": "Customization",
+            "group": "Core Concepts",
             "pages": [
-              "essentials/settings",
-              "essentials/navigation"
+              "concepts/architecture",
+              "concepts/inference-pipeline",
+              "concepts/gguf-format",
+              "concepts/definitions"
             ]
           },
           {
-            "group": "Writing content",
+            "group": "Guides",
             "pages": [
-              "essentials/markdown",
-              "essentials/code",
-              "essentials/images",
-              "essentials/reusable-snippets"
+              "guides/lora-training",
+              "guides/long-context",
+              "guides/grammar-constrained",
+              "guides/hybrid-inference",
+              "guides/benchmarking"
             ]
           },
           {
-            "group": "AI tools",
+            "group": "Optimization",
             "pages": [
-              "ai-tools/cursor",
-              "ai-tools/claude-code",
-              "ai-tools/windsurf"
+              "optimization/llogos-turbo",
+              "optimization/inference-optimization"
             ]
           }
         ]
       },
       {
-        "tab": "API reference",
+        "tab": "Reference",
         "groups": [
           {
-            "group": "API documentation",
+            "group": "Compute Backends",
             "pages": [
-              "api-reference/introduction"
+              "reference/backends/cuda",
+              "reference/backends/vulkan",
+              "reference/backends/webgpu"
             ]
           },
           {
-            "group": "Endpoint examples",
+            "group": "Supported Architectures",
             "pages": [
-              "api-reference/endpoint/get",
-              "api-reference/endpoint/create",
-              "api-reference/endpoint/delete",
-              "api-reference/endpoint/webhook"
+              "reference/architectures/llama",
+              "reference/architectures/qwen2",
+              "reference/architectures/qwen3",
+              "reference/architectures/qwen35",
+              "reference/architectures/bitnet"
+            ]
+          },
+          {
+            "group": "CLI Reference",
+            "pages": [
+              "reference/cli/inference",
+              "reference/cli/training"
+            ]
+          },
+          {
+            "group": "Resources",
+            "pages": [
+              "reference/tested-models",
+              "reference/known-issues"
             ]
           }
         ]
       }
-    ],
-    "global": {
-      "anchors": [
-        {
-          "anchor": "Documentation",
-          "href": "https://mintlify.com/docs",
-          "icon": "book-open-cover"
-        },
-        {
-          "anchor": "Blog",
-          "href": "https://mintlify.com/blog",
-          "icon": "newspaper"
-        }
-      ]
-    }
-  },
-  "logo": {
-    "light": "/logo/light.svg",
-    "dark": "/logo/dark.svg"
-  },
-  "navbar": {
-    "links": [
-      {
-        "label": "Support",
-        "href": "mailto:hi@mintlify.com"
-      }
-    ],
-    "primary": {
-      "type": "button",
-      "label": "Dashboard",
-      "href": "https://dashboard.mintlify.com"
-    }
-  },
-  "contextual": {
-    "options": [
-     "copy",
-     "view",
-     "chatgpt",
-     "claude",
-     "perplexity",
-     "mcp",
-     "cursor",
-     "vscode"
-   ]
-  },
-  "footer": {
-    "socials": {
-      "x": "https://x.com/mintlify",
-      "github": "https://github.com/mintlify",
-      "linkedin": "https://linkedin.com/company/mintlify"
-    }
+    ]
   }
 }

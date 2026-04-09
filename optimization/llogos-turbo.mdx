@@ -1,0 +1,278 @@
+---
+title: "LLogos Turbo: extreme KV cache compression for GGUF models"
+description: "Compress KV cache 8–12× using Walsh-Hadamard rotation, MSE-optimal scalar quantization, and QJL correction — no training or calibration needed."
+keywords: ["kv cache", "quantization", "turbo", "walsh-hadamard", "memory compression", "gguf"]
+---
+
+LLogos Turbo achieves 8–12× KV cache memory reduction through a three-stage compression pipeline: Walsh-Hadamard rotation, MSE-optimal scalar quantization, and QJL sign-bit correction. Based on Google Research's [TurboQuant](https://arxiv.org/abs/2504.19874) paper, it integrates directly into the inference engine as a drop-in `IKvCache` replacement — no changes to model weights, no fine-tuning, no calibration data.
+
+## Why KV cache compression matters
+
+During autoregressive decoding, every generated token attends to all previous tokens. The Key and Value tensors for every past position accumulate in the **KV cache**, growing linearly with context length. At long contexts and large model sizes, the KV cache dominates VRAM — competing directly with model weights.
+
+| Model | Context | F16 KV cache | Turbo 3-bit | Savings |
+|-------|---------|-------------|-------------|---------|
+| Qwen3.5-0.8B (6 attn layers) | 32K | 96 MB | 11 MB | 85 MB |
+| Qwen3.5-9B (8 attn layers) | 32K | 2.0 GB | 230 MB | 1.8 GB |
+| Qwen3.5-27B (16 attn layers) | 32K | 2.0 GB | 465 MB | 1.5 GB |
+| Qwen3.5-27B (16 attn layers) | 128K | 8.0 GB | 1.8 GB | 6.2 GB |
+
+Compressing the KV cache enables longer contexts, larger batch sizes, or running models that would not otherwise fit in VRAM. On a 16 GB RTX 5080 with Qwen3.5-27B Q4_0 consuming ~15 GB for weights, F16 KV leaves only ~500 token positions of headroom. Turbo 4-bit expands that to ~4K — the difference between a single-turn reply and a multi-turn conversation.
+
+<Note>
+  LLogos Turbo requires no training, no calibration, and no fine-tuning. It works as a drop-in replacement at inference time with any GGUF model.
+</Note>
+
+## Three-stage compression pipeline
+
+```
+Write path (per KV head, per position):
+  input[d] → normalize by RMS → WHT rotate → scalar quantize → pack bits
+                                         ↓
+                               compute residual → project → store sign bits + norm
+
+Read path (fused into attention):
+  packed bits → dequantize → inverse WHT → rescale → dot with Q → + QJL correction → attention score
+```
+
+### Stage 1: Walsh-Hadamard rotation
+
+Raw KV vectors often contain outlier dimensions with magnitudes far larger than the rest. Fixed-grid quantization assigns most of its resolution to those outliers and wastes precision everywhere else.
+
+The Walsh-Hadamard Transform (WHT) with random sign flips rotates the vector into a space where all dimensions have similar magnitude:
+
+```
+original:  [0.01, 0.02, 50.0, 0.03, ...]  ← outlier at dim 2
+                       ↓ WHT rotation
+rotated:   [6.25, 6.24, 6.26, 6.25, ...]  ← uniform, quantizer-friendly
+```
+
+WHT has four properties that make it ideal for this role:
+
+| Property | Description |
+|----------|-------------|
+| **Orthonormal** | Preserves vector norms and inner products (`‖Hx‖ = ‖x‖`) |
+| **O(d log d)** | Faster than matrix multiply via butterfly structure |
+| **Self-inverse** | `H(Hx) = x` — same operation for forward and inverse |
+| **Data-oblivious** | The same rotation works for any vector — no calibration needed |
+
+Implementation: `WalshHadamard.cs` with AVX2 SIMD butterfly passes and scalar fallback.
+
+### Stage 2: MSE-optimal scalar quantization
+
+After rotation, each coordinate follows an approximately Gaussian distribution. A pre-computed Lloyd-Max quantization grid maps each float to 2, 3, or 4 bits:
+
+| Bits | Levels | Bits/dim | Typical MSE (unit variance) |
+|------|--------|----------|---------------------------|
+| 2 | 4 | 2.0 | ~0.36 |
+| 3 | 8 | 3.0 | ~0.09 |
+| 4 | 16 | 4.0 | ~0.02 |
+
+Values are packed into byte arrays (4-bit: 2 values/byte; 3-bit: bit-packed; 2-bit: 4 values/byte). A per-head RMS scale factor is stored alongside for denormalization.
+
+Implementation: `ScalarQuantizer.cs` with pre-computed boundary and centroid tables.
+
+### Stage 3: QJL sign-bit residual correction
+
+MSE-optimal quantization minimizes reconstruction error but introduces **bias in inner product estimation** — which is exactly what attention scores compute. The QJL (Quantized Johnson-Lindenstrauss) correction addresses this:
+
+**On write:** Compute the residual `r = rotated − quantized`. Project through a random Rademacher matrix `R` and store only the sign bits: `sign(R · r)`. Also store the residual's L2 norm.
+
+**On attention:** For each Q-K dot product, add a correction term using the stored sign bits and residual norm. The correction is computed using pre-computed query projections (once per head, reused across all positions) for efficiency.
+
+The estimator uses sign agreement between the residual and query projections, scaled by the residual norm and query projection magnitude, to approximate the missing `q · residual` term.
+
+Implementation: `QjlProjection.cs` with `PrecomputeQueryProjections` for amortized per-head cost.
+
+## Architecture
+
+### CPU: fused compressed attention
+
+`TurboQuantKvCache` implements `IKvCache` as a drop-in replacement for `KvCache` or `PagedKvCache`. The `ForwardPass` and all backend code work unchanged.
+
+Rather than decompressing the entire KV cache into F32 tensors for each decode step, `TurboQuantKvCache` performs attention directly from compressed data. Each K and V vector is decompressed inline — one at a time — during the attention dot product loop. Only a single `float[headDim]` buffer is needed regardless of sequence length.
+
+```csharp
+// ForwardPass tries fused path first, falls back to standard
+if (!_kvCache.ComputeAttention(_attnOut, _qAttn, _qGate,
+        layer, numHeads, numKvHeads, keyLen, valLen, seqLen, scale))
+{
+    // Standard path: decompress → F32 tensors → GatedAttention
+    var kCache = _kvCache.GetKCacheTensor(layer);
+    var vCache = _kvCache.GetVCacheTensor(layer);
+    _backend.GatedAttention(...);
+}
+```
+
+Standard `KvCache` and `PagedKvCache` return `false` and use the standard path. `TurboQuantKvCache` returns `true` and handles attention itself. No backend changes needed.
+
+### CUDA: adaptive dual-path architecture
+
+On GPU, `CudaTurboQuantKvCache` implements a dual-path strategy for best-of-both-worlds performance:
+
+**Dual write:** Every position is written to both F16 shadow tensors (on the main CUDA stream, inside graph capture) and compressed TurboQuant storage (on a secondary async stream, outside the graph). The async stream runs the `turbo_kv_write` compression kernel without impacting the main forward pass.
+
+**Adaptive read:** At short context (KV fits in L2 cache), `ComputeAttention` returns `false` — the forward pass uses the baseline `GatedAttention` kernel with F16 tensors at full speed. When context crosses the L2 threshold (KV spills to HBM), it returns `true` — the compressed `turbo_gated_attention` kernel reads 4–8× fewer bytes from HBM.
+
+**Zero-cost transition:** Compressed data is always current (written every token on the async stream). Switching to compressed attention only requires syncing the async stream.
+
+### CUDA: rotated-domain attention
+
+The compressed attention kernel eliminates per-position WHT via a key algebraic identity: since WHT is orthonormal and self-inverse, dot products can be computed in the rotated domain.
+
+```
+q · k_original = scale_k × q_rotated · k_centroids
+where q_rotated = (1/√n) · H · (D_k · q)  — one WHT per head
+```
+
+This eliminates all per-position WHTs for K scoring. For V, centroids are accumulated in the rotated domain with a single inverse WHT of the final result. Additional optimizations include a shared memory centroid lookup table (16 floats) and pre-computed combined V weights that reduce the V inner loop to 1 byte load + 1 LUT lookup + 1 FMA.
+
+### File map
+
+```
+Daisi.Llogos/Inference/DaisiTurbo/           CPU implementation
+├── WalshHadamard.cs                         Fast WHT with AVX2 SIMD + scalar fallback
+├── ScalarQuantizer.cs                       Lloyd-Max 2/3/4-bit quantizer with bit packing
+├── QjlProjection.cs                         Sign-bit residual correction with precomputed projections
+├── TurboQuantConfig.cs                      Configuration + CLI parsing
+└── TurboQuantKvCache.cs                     IKvCache: compressed storage + fused CPU attention
+
+Daisi.Llogos.Cuda/                           CUDA implementation
+├── CudaTurboQuantKvCache.cs                 IKvCache: adaptive dual-path (F16 + compressed)
+└── kernels/turbo_quant.cu                   CUDA kernels: turbo_kv_write + turbo_gated_attention
+```
+
+## Usage
+
+### CLI
+
+```bash
+# Default 3-bit (best quality/compression tradeoff)
+dotnet run -- --model model.gguf --prompt "Hello" --kv-quant turbo
+
+# 4-bit (higher quality, less compression)
+dotnet run -- --model model.gguf --prompt "Hello" --kv-quant turbo:4
+
+# 2-bit (extreme compression, some quality loss)
+dotnet run -- --model model.gguf --prompt "Hello" --kv-quant turbo:2
+
+# Explicit QJL projection dimension
+dotnet run -- --model model.gguf --prompt "Hello" --kv-quant turbo:3+qjl32
+
+# Disable QJL (fastest, pure scalar quantization)
+dotnet run -- --model model.gguf --prompt "Hello" --kv-quant turbo:3+noqjl
+
+# Benchmark with compression stats
+dotnet run -- --model model.gguf --bench --kv-quant turbo:3
+
+# Combine with attention sinks
+dotnet run -- --model model.gguf --prompt "Hello" --kv-quant turbo:3 --attention sinks:64,4096
+```
+
+### Configuration options
+
+| Option | Description |
+|--------|-------------|
+| `turbo` | 3-bit quantization with QJL (headDim/2 projection dims) |
+| `turbo:N` | N-bit quantization (2, 3, or 4) with default QJL |
+| `turbo:N+noqjl` | N-bit quantization, no QJL correction (fastest) |
+| `turbo:N+qjlM` | N-bit quantization with M QJL projection dimensions |
+
+### Programmatic
+
+```csharp
+var turboConfig = new TurboQuantConfig { QuantBits = 3, QjlProjectionDim = 0 };
+IKvCache kvCache = new TurboQuantKvCache(backend, modelConfig,
+    maxSeqLen: 32768, turboConfig: turboConfig);
+
+// Use exactly like KvCache — ForwardPass is unchanged
+var forward = new ForwardPass(backend, config, weights, kvCache, deltaState);
+```
+
+## Benchmarks
+
+### CUDA — RTX 5080 (16 GB VRAM, Blackwell)
+
+**Qwen3.5-0.8B Q8_0** (6 attention layers / 24 total, hybrid DeltaNet)
+
+| Context | Baseline F16 | Turbo 4-bit | vs baseline | Compression | KV savings |
+|---------|-------------|-------------|-------------|-------------|-----------|
+| 138 tokens | 435 tok/s | 424 tok/s | 97.4% | 7.8× | 3.3 KB → 0.4 KB |
+| 4.5K tokens | 138 tok/s | 137 tok/s | 99.3% | 7.8× | 107 MB → 14 MB |
+
+**Qwen3.5-9B Q4_0** (8 attention layers / 48 total, hybrid DeltaNet)
+
+| Context | Baseline F16 | Turbo 4-bit | vs baseline | Compression | KV savings |
+|---------|-------------|-------------|-------------|-------------|-----------|
+| 39 tokens | 98.3 tok/s | 96.5 tok/s | 98.2% | 7.8× | 1.2 MB → 0.2 MB |
+| 4K tokens | 62.5 tok/s | 53.8 tok/s | 86.1% | 7.8× | 128 MB → 16 MB |
+
+### CPU — AMD Ryzen 9 9900X, Qwen3.5-0.8B Q8_0, 128 decode tokens
+
+| Configuration | Decode (tok/s) | KV memory | Compression | vs baseline |
+|---------------|---------------|-----------|-------------|-------------|
+| Baseline F16 | 33.4 | 3,624 KB | 1.0× | — |
+| Turbo 4-bit+noqjl | 34.8 | 467 KB | 7.8× | +4% |
+| Turbo 3-bit+noqjl | 32.4 | 354 KB | 10.2× | −3% |
+| Turbo 3-bit+qjl | 28.4 | 411 KB | 8.8× | −15% |
+| Turbo 2-bit+noqjl | 30.6 | 303 KB | 12.2× | −8% |
+
+### CUDA kernel optimization history
+
+The CUDA compressed attention kernel went through 6 iterations from 45 tok/s to 422 tok/s:
+
+| Version | tok/s | vs baseline | Key optimization |
+|---------|------:|-------------|-----------------|
+| v1 | 45 | 10% | Per-position WHT (naive) |
+| v2 | 167 | 38% | Rotated-domain K: eliminate per-position WHT |
+| v3 | 247 | 56% | Fused K dequant+dot product: zero intermediate arrays |
+| v4 | 253 | 57% | Parallel V dequant + Blackwell shared memory fix |
+| v5 | 266 | 61% | Shared memory centroid LUT + precomputed V weights |
+| **v6** | **422** | **97%** | **Adaptive dual-path: F16 at short context, compressed at long** |
+
+### Performance characteristics
+
+At short context (138 tokens), attention accounts for only 3.6% of total decode time — weight matmuls dominate at 96.4%. The 2.6% overhead at short context comes from async compressed write stream contention, as the GPU shares SMs between the main forward pass and background compression.
+
+As context grows, attention becomes a larger fraction of total time: ~50% at 4K tokens, ~80% at 16K, ~94% at 64K. At those lengths, reading 4-bit packed data (32 bytes per K position) instead of F16 (128 bytes) delivers real bandwidth savings and the compressed path runs faster than F16.
+
+### VRAM headroom at scale
+
+| Model on RTX 5080 (16 GB) | Weights | F16 KV headroom | Turbo 4-bit headroom |
+|--------------------------|---------|-----------------|----------------------|
+| Qwen3.5-0.8B Q8_0 | 0.8 GB | 15.2 GB (~millions of tokens) | N/A (plenty of room) |
+| Qwen3.5-9B Q4_0 | 5.2 GB | 10.8 GB (~170K tokens) | 10.8 GB (~1.3M tokens) |
+| Qwen3.5-27B Q4_0 | 15 GB | 1 GB (~500 tokens) | 1 GB (~4K tokens) |
+
+## Bit precision trade-offs
+
+- **4-bit**: Highest quality, 7.8× compression. Near-identical throughput to F16 at short context. Recommended when VRAM allows.
+- **3-bit**: Best quality/compression tradeoff. 10× compression with ~3% throughput overhead on CPU. Default for `--kv-quant turbo`.
+- **2-bit**: Extreme compression at 12×. Measurable quality degradation on long, information-dense contexts. Suitable for memory-critical deployments where some quality loss is acceptable.
+
+Adding `+noqjl` removes the sign-bit correction for maximum speed at the cost of inner product accuracy. Adding `+qjlM` sets the projection dimension explicitly — larger M improves correction quality at higher compute cost.
+
+## Test coverage
+
+44 tests across all components:
+
+| Component | Tests | What is validated |
+|-----------|-------|------------------|
+| WalshHadamard | 8 | Round-trip invertibility, energy preservation, outlier spreading, determinism |
+| ScalarQuantizer | 10 | Pack/unpack round-trip, MSE bounds per bit-width, level reachability, symmetry |
+| QjlProjection | 7 | Sign preservation, batch consistency, variance reduction, norm-aware MSE reduction |
+| TurboQuantKvCache | 19 | Write/read accuracy, multi-position, stats, config parsing, sliding window, bit-widths |
+
+## References
+
+- [TurboQuant: Online Vector Quantization with Near-optimal Distortion Rate](https://arxiv.org/abs/2504.19874) — Zandieh, Daliri, Hadian, Mirrokni (Google Research, 2025)
+- [TurboQuant: Redefining AI Efficiency with Extreme Compression](https://research.google/blog/turboquant-redefining-ai-efficiency-with-extreme-compression/) — Google Research Blog
+
+<CardGroup cols={2}>
+  <Card title="Inference optimization" icon="bolt" href="/optimization/inference-optimization">
+    CUDA and Vulkan kernel optimizations that push throughput past llama.cpp
+  </Card>
+  <Card title="Long context" icon="scroll" href="/guides/long-context">
+    Flash attention, paged KV cache, and RAM offloading for 200K+ context
+  </Card>
+</CardGroup>

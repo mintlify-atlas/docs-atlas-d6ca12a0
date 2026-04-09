@@ -1,0 +1,108 @@
+---
+title: "BitNet b1.58 ternary weight architecture"
+description: "BitNet b1.58 uses ternary weights encoded as I2_S (2 bits per weight). LLogos includes dedicated CUDA and AVX2 kernels for branchless ternary matmul."
+keywords: ["bitnet", "ternary", "i2s", "1-bit", "extreme quantization", "gguf", "architecture"]
+---
+
+BitNet b1.58 uses ternary weights (values {-1, 0, +1}) encoded in I2_S format, enabling extreme compression while maintaining reasonable quality. LLogos includes dedicated CUDA and Vulkan kernels for ternary weight matmul.
+
+## GGUF architecture identifier
+
+The `bitnet-b1.58` architecture string is set in the GGUF metadata. This architecture requires a separate model loading path — the `BitNetModelLoader` — because the I2_S format stores a per-tensor scale rather than the per-block scales used in every other quantization format.
+
+## I2_S weight encoding
+
+Each byte stores four ternary values at 2 bits each:
+
+```
+I2_S weight encoding
+=====================
+
+Each byte stores 4 ternary values (2 bits each):
+
+Byte: [7:6] [5:4] [3:2] [1:0]
+       |      |      |      |
+       v      v      v      v
+    elem+0  elem+32 elem+64 elem+96
+    × 32    × 32    × 32    × 32
+
+Encoding: 00 = -1,  01 = 0,  10 = +1,  11 = 0
+
+128-element interleaved groups
+Per-tensor float32 scale at byte offset (nelements / 4)
+```
+
+The interleaved layout means elements are not stored sequentially — element 0 and element 32 occupy adjacent bits in the same byte. Decoding requires accounting for this stride.
+
+## Key differences from other architectures
+
+| Property | Standard GGUF (e.g. Q8_0) | BitNet I2_S |
+|----------|---------------------------|-------------|
+| Bits per weight | 8 | 2 |
+| Weight values | Quantized float | {-1, 0, +1} ternary |
+| Scale granularity | Per block (32 or 64 elements) | Per tensor (single float32) |
+| Scale location | Inline with block data | At end of packed data |
+| Model loader | Standard `ModelLoader` | `BitNetModelLoader` |
+
+<Note>
+The per-tensor scale placement is the reason BitNet requires a dedicated loader. Standard `ModelLoader` expects per-block scales interleaved with the weight data. I2_S places a single float32 at the very end of the packed tensor bytes, after all weight data.
+</Note>
+
+## Feature summary
+
+| Feature | Details |
+|---------|---------|
+| I2_S quantization | 2-bit packed ternary with per-tensor float32 scale |
+| Interleaved groups | 128 elements in 32-byte groups with strided layout |
+| Dedicated model loader | `BitNetModelLoader` handles the per-tensor scale placement |
+| CUDA kernel | `dequant_matmul_i2s` with branchless ternary decode |
+| CPU kernel | `DotI2SAvx2` with AVX2 SIMD ternary decode |
+
+## Implementation notes
+
+**Branchless ternary decode in CUDA.** The inner decode loop uses `(c == 2) - (c == 0)` to map the 2-bit value to {-1, 0, +1} without any branch instructions. Branching in the inner loop of a GPU kernel would cause severe warp divergence across the 128-element groups.
+
+**AVX2 CPU kernel.** `DotI2SAvx2` decodes 128 elements at a time using SIMD comparison and subtraction, matching the same branchless logic. This allows CPU inference on BitNet models without CUDA or Vulkan.
+
+**Standard loading fails.** Attempting to load a BitNet model through the standard `ModelLoader` will misread the scale — it expects a per-block scale at a known offset within each block, which does not exist in I2_S. Always use `BitNetModelLoader` for `bitnet-b1.58` GGUF files.
+
+**Custom GGUF build required.** The official BitNet GGUF distribution may not always align with the I2_S format expected by LLogos. Check the GGUF metadata for `general.quantization_version` and verify the tensor layout before loading.
+
+## Supported quantization formats
+
+I2_S only. BitNet models are not available in standard quantization formats — the ternary weight structure is intrinsic to the architecture.
+
+## Supported models
+
+| Model | Parameters | Quant | Notes |
+|-------|-----------|-------|-------|
+| BitNet b1.58 large | 0.7B | I2_S (ternary) | Custom GGUF build required |
+
+## Benchmarks
+
+Measured on AMD Ryzen 9 9900X + NVIDIA RTX 5080.
+
+| Model | Quant | LLogos CUDA (tok/s) | Notes |
+|-------|-------|--------------------:|-------|
+| BitNet b1.58 0.7B | I2_S | ~150 | Ternary matmul, branchless decode |
+
+## Known quirks and limitations
+
+- **Custom GGUF build required.** Not all BitNet GGUF files floating around Hugging Face use the exact I2_S layout LLogos expects. Verify the layout before filing a bug report.
+- **No LoRA training support.** LoRA training for BitNet models is not implemented. The ternary weight constraint requires specialized gradient handling that is out of scope.
+- **Per-tensor scale limits accuracy recovery.** Unlike per-block quantization (which can adapt scale to local weight distributions), a single scale for the entire tensor means outlier weights cause larger quantization error. This is a fundamental property of I2_S, not an LLogos-specific limitation.
+
+<CardGroup cols={2}>
+  <Card title="LLaMA architecture" icon="layer-group" href="/reference/architectures/llama">
+    Baseline transformer — standard quantization formats
+  </Card>
+  <Card title="Qwen 3 Bonsai 1-bit" icon="layer-group" href="/reference/architectures/qwen3">
+    Q1_0_g128 for 8B parameters in 1.1 GB — an alternative extreme quantization
+  </Card>
+  <Card title="CUDA backend" icon="microchip" href="/reference/backends/cuda">
+    I2_S dequant_matmul_i2s kernel and dp4a dispatch details
+  </Card>
+  <Card title="Tested models" icon="list-check" href="/reference/tested-models">
+    Full list of verified GGUF models with download links
+  </Card>
+</CardGroup>

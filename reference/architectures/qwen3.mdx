@@ -1,0 +1,141 @@
+---
+title: "Qwen 3 and Bonsai 1-bit model support"
+description: "Qwen 3 adds gated Q projection, per-head Q/K norms, and thinking mode. LLogos also supports Bonsai 8B — 8B parameters in 1.1 GB via Q1_0 quantization."
+keywords: ["qwen3", "bonsai", "q1_0", "1-bit", "gated attention", "per-head norm", "thinking mode", "gguf"]
+---
+
+Qwen 3 introduces gated Q (DeInterleaveQ), per-head Q/K norms, and a thinking mode. LLogos also supports the Bonsai 1-bit quantization (Q1_0/Q1_0_g128) for running 8B-parameter models in 1.1 GB.
+
+## GGUF architecture identifier
+
+The `qwen3` architecture string covers both standard Qwen3 models and the Bonsai-8B 1-bit variant, which is Qwen3-8B quantized to Q1_0_g128.
+
+## Layer structure
+
+All layers in Qwen 3 use standard attention. There are no DeltaNet layers (that hybrid design appears in Qwen 3.5).
+
+```
+All 36 layers: standard gated attention
+========================================
+
+normOut ──> Q projection (2× output: Q_attn + Q_gate interleaved)
+                |
+                v
+         DeInterleaveQ ──> Q_attn, Q_gate
+                |
+                v
+         PerHeadRmsNorm(Q_attn, K)
+                |
+                v
+             RoPE(Q, K)
+                |
+                v
+         KV cache write ──> GatedAttention
+                |
+                v
+         O projection ──> hidden
+```
+
+## Key differences from LLaMA
+
+| Feature | LLaMA | Qwen 3 |
+|---------|-------|--------|
+| Q projection output | 1× hidden dim | 2× hidden dim (Q_attn + Q_gate interleaved) |
+| Q/K norms | None | Per-head RMSNorm after projection |
+| Attention gating | None | Q_gate multiplies into attention output |
+| RoPE theta | 500,000 (Llama 3) | 1,000,000 (longer context capable) |
+| Thinking mode | No | Yes — model outputs `<think>…</think>` before answering |
+
+<Note>
+The gated Q projection doubles the weight matrix size for the Q projection. LLogos reads the full 2× output and runs `DeInterleaveQ` to split it into `Q_attn` and `Q_gate` before applying norms and RoPE.
+</Note>
+
+## Feature summary
+
+| Feature | Details |
+|---------|---------|
+| Gated Q | Q output is 2× dim; deinterleaved into Q_attn and Q_gate |
+| Per-head Q/K norms | RMSNorm applied independently per head after projection |
+| GQA | 32 query heads / 8 KV heads (4:1 ratio) |
+| Thinking mode | Model generates `<think>…</think>` block before response |
+| RoPE theta | 1,000,000 — supports longer context windows |
+| Tool calling | Requires Qwen3-specific preamble: `# Tools\n\nYou may call one or more functions…` |
+
+## Bonsai 1-bit quantization (Q1_0_g128)
+
+Bonsai-8B is Qwen3-8B quantized to Q1_0_g128 by PrismML. The 8B parameter model fits in 1.1 GB — roughly the same footprint as a 1B Q8_0 model.
+
+### Q1_0_g128 kernel optimizations
+
+The naive decoding approach achieved only 25.7 tok/s. LLogos reaches 90.2 tok/s (3.5× speedup) through the following optimizations:
+
+```
+Q1_0_g128 CUDA kernel optimizations
+=====================================
+
+Naive:      25.7 tok/s  (per-bit branching)
+Optimized:  90.2 tok/s  (3.5× speedup)
+
+Key changes:
+- Float4 activation loads via __ldg (read-only texture cache)
+- 4-row multi-output blocks (activation reuse across rows)
+- Branchless FMA sign multiply: (2 * bit - 1) * scale
+- Scale hoisted outside inner loop (1 mul per 128 elements)
+- 32 sign bits loaded as uint32, processed in float4 groups
+```
+
+## Implementation notes
+
+**Q8_0 block repacking.** All Q8_0 weights are repacked to 36-byte aligned blocks regardless of the hidden dimension. Many weight matrices in the 8B model have `K < 2048`, so the alignment must be applied universally — not gated on K size.
+
+**Tiled flash attention.** LLogos uses online softmax with 256-position tiles, keeping shared memory usage constant regardless of context length.
+
+**Tool calling format.** Qwen 3 expects a specific preamble for tool definitions: `# Tools\n\nYou may call one or more functions…`. Using a generic `<tools>` block causes quality degradation with long tool lists because the model was fine-tuned on this exact format.
+
+**Vocab remapper.** Qwen 3 has a 151K-token vocabulary. Without the partial vocab remapper, argmax searches the full vocabulary on every decode step. The remapper limits the search to the top ~5K candidate tokens.
+
+## Supported quantization formats
+
+Q8_0, Q4_K_M, Q1_0_g128 (Bonsai), F16, BF16, F32
+
+## Supported models
+
+| Model | Parameters | Tested quants | Notes |
+|-------|-----------|---------------|-------|
+| Qwen3-8B | 8B | Q8_0, Q4_K_M | Standard Qwen3 with thinking mode |
+| Bonsai-8B | 8B | Q1_0_g128 | 1.1 GB on disk, 90 tok/s on CUDA |
+
+## Benchmarks
+
+Measured on AMD Ryzen 9 9900X + NVIDIA RTX 5080, 128 decode tokens, FP16 KV cache. Compared against llama.cpp b8461.
+
+| Model | Quant | LLogos CUDA (tok/s) | llama.cpp CUDA (tok/s) | vs llama.cpp |
+|-------|-------|--------------------:|----------------------:|:------------:|
+| Qwen3-8B | Q8_0 | 91 | 92 | 99% |
+| Qwen3-8B | Q4_K_M | 127 | 138 | 92% |
+| Bonsai-8B | Q1_0_g128 | 90 | — | — |
+
+<Tip>
+Bonsai-8B Q1_0_g128 offers 8B-parameter quality at 1.1 GB. If you have 2 GB of VRAM free, it is often a better choice than a 1B model at Q8_0 and runs at comparable speed.
+</Tip>
+
+## Known quirks and limitations
+
+- **Q4_K_M gap vs llama.cpp.** Qwen3-8B Q4_K_M runs at 92% of llama.cpp speed. The gap is narrowing through fused SwiGLU and cooperative dp4a kernels — see the [inference optimization](/optimization/inference-optimization) page for details.
+- **Thinking mode overhead.** The `<think>…</think>` block adds latency before the visible response. Set temperature to 0 and add `<think>\n` to the prompt to make the model skip the thinking preamble when you do not need it.
+- **Generic tool format degrades quality.** Always use the Qwen3-specific tool preamble format for reliable function calling.
+
+<CardGroup cols={2}>
+  <Card title="Qwen 2/2.5 architecture" icon="layer-group" href="/reference/architectures/qwen2">
+    Earlier Qwen family — attention biases, no gating or per-head norms
+  </Card>
+  <Card title="Qwen 3.5 DeltaNet architecture" icon="layer-group" href="/reference/architectures/qwen35">
+    Hybrid DeltaNet + gated attention for O(1) long-context memory
+  </Card>
+  <Card title="CUDA backend" icon="microchip" href="/reference/backends/cuda">
+    Q1_0_g128 kernel details and dp4a optimizations
+  </Card>
+  <Card title="Tested models" icon="list-check" href="/reference/tested-models">
+    Full list of verified GGUF models with download links
+  </Card>
+</CardGroup>

@@ -1,0 +1,179 @@
+---
+title: 'Get started with LLogos on .NET'
+description: 'Clone the repos, build the solution, download a test model, and stream generated text from CPU, CUDA, or Vulkan — all from the LLogos CLI.'
+---
+
+This guide walks you through building and running your first LLogos inference session on .NET, from cloning the repository to streaming generated text. By the end you will have produced tokens from a Qwen 3.5 model on at least one compute backend and seen the prefill/decode performance numbers in your terminal.
+
+## Prerequisites
+
+- .NET 9 SDK or later
+- Git
+- A GGUF model file (downloaded in step 3)
+- For CUDA: NVIDIA GPU with CUDA 13 drivers
+- For Vulkan: Any GPU with Vulkan 1.2 drivers (NVIDIA, AMD, or Intel)
+
+<Steps>
+
+<Step title="Clone both repositories side by side">
+
+LLogos depends on the Daisi SDK for the `IInferenceBackend` interface. Both repositories must live under the same parent directory.
+
+```bash
+mkdir daisinet && cd daisinet
+git clone https://github.com/daisinet/daisi-dotnet-sdk
+git clone https://github.com/daisinet/daisi-llogos
+```
+
+Your directory structure should now look like this:
+
+```
+daisinet/
+  daisi-dotnet-sdk/
+  daisi-llogos/
+```
+
+<Note>
+The solution resolves the SDK reference by relative path (`../daisi-dotnet-sdk`). If the two folders are not siblings, the build will fail with a missing project reference error.
+</Note>
+</Step>
+
+<Step title="Build the solution">
+
+Navigate into the llogos repository and build. The first build compiles NVRTC kernels and SPIR-V shaders, so it may take a minute.
+
+```bash
+cd daisi-llogos
+dotnet build
+```
+
+A successful build produces binaries for `Daisi.Llogos`, `Daisi.Llogos.Cpu`, `Daisi.Llogos.Cuda`, `Daisi.Llogos.Vulkan`, and `Daisi.Llogos.Cli` under their respective `bin/` directories.
+</Step>
+
+<Step title="Download the test model">
+
+The test suite and examples use [Qwen 3.5 0.8B Q8_0](https://huggingface.co/unsloth/Qwen3.5-0.8B-GGUF). Download the GGUF file and place it in `C:\GGUFS\`:
+
+```bash
+# Create the models directory
+mkdir C:\GGUFS
+
+# Download via huggingface-cli (pip install huggingface_hub)
+huggingface-cli download unsloth/Qwen3.5-0.8B-GGUF Qwen3.5-0.8B-Q8_0.gguf --local-dir C:\GGUFS
+```
+
+Or download manually from HuggingFace and save to `C:\GGUFS\Qwen3.5-0.8B-Q8_0.gguf`. Tests skip gracefully if the file is not present, so no other step requires this exact path.
+</Step>
+
+<Step title="Run inference">
+
+Use the CLI to generate text. Select your backend with `--backend`. If you omit it, the engine defaults to CPU.
+
+<Tabs>
+  <Tab title="CPU">
+```bash
+dotnet run --project src/dotnet/Daisi.Llogos.Cli -- \
+    --model C:\GGUFS\Qwen3.5-0.8B-Q8_0.gguf \
+    --prompt "Hello, world"
+```
+
+CPU uses AVX2/AVX-512 SIMD multi-threaded matrix multiply. It works on any x64 machine but is significantly slower than GPU backends. Expect 10–30 tok/s on a modern desktop processor.
+  </Tab>
+  <Tab title="CUDA">
+```bash
+dotnet run --project src/dotnet/Daisi.Llogos.Cli -- \
+    --model C:\GGUFS\Qwen3.5-0.8B-Q8_0.gguf \
+    --prompt "Hello, world" \
+    --backend cuda
+```
+
+CUDA is the fastest backend. On an RTX 5080, Qwen3.5-0.8B Q8_0 reaches **441 tok/s decode** — 10% faster than llama.cpp on the same hardware. NVRTC JIT-compiles kernels on first run and caches the PTX to disk for subsequent launches.
+
+<Note>
+Requires an NVIDIA GPU with CUDA 13 drivers installed. The first run may take a few extra seconds while NVRTC compiles and caches the kernels.
+</Note>
+  </Tab>
+  <Tab title="Vulkan">
+```bash
+dotnet run --project src/dotnet/Daisi.Llogos.Cli -- \
+    --model C:\GGUFS\Qwen3.5-0.8B-Q8_0.gguf \
+    --prompt "Hello, world" \
+    --backend vulkan
+```
+
+Vulkan works on NVIDIA, AMD, and Intel GPUs using SPIR-V compute shaders. It is slower than CUDA on NVIDIA hardware (156 tok/s vs 441 tok/s for Qwen3.5-0.8B) but gives GPU acceleration to non-NVIDIA machines.
+
+<Note>
+Requires Vulkan 1.2 drivers. Any modern discrete GPU on Windows supports this. Intel integrated graphics may work but has not been benchmarked.
+</Note>
+  </Tab>
+</Tabs>
+
+After generation completes, the CLI prints a performance summary to stderr:
+
+```
+[prefill: 8 tokens, 1243.2 tok/s | decode: 128 tokens, 441.0 tok/s]
+```
+</Step>
+
+</Steps>
+
+## Backend selection in code
+
+The CLI's backend selection mirrors the `IComputeBackend` pattern used throughout the library. Here is the relevant code from `Program.cs`:
+
+```csharp
+IComputeBackend backend = options.Backend switch
+{
+    "cuda"   => new CudaBackend(),
+    "vulkan" => new VulkanBackend(),
+    _        => new CpuBackend(),
+};
+```
+
+All three backends implement the same `IComputeBackend` interface. The forward pass, tokenizer, and sampler are identical regardless of which backend you choose — only the tensor operations are dispatched differently.
+
+## Run the test suite
+
+```bash
+dotnet test
+```
+
+The test suite has 251+ passing tests. Tests that require the Qwen3.5-0.8B model at `C:\GGUFS\Qwen3.5-0.8B-Q8_0.gguf` skip gracefully if the file is absent. GPU tests skip if the required driver is not present.
+
+## Additional CLI options
+
+A few flags are useful for exploration:
+
+```bash
+# Benchmark mode — measures prefill and decode tok/s separately
+dotnet run --project src/dotnet/Daisi.Llogos.Cli -- \
+    --model C:\GGUFS\Qwen3.5-0.8B-Q8_0.gguf \
+    --bench --backend cuda
+
+# Sliding window + attention sinks (fixed memory, infinite streaming)
+dotnet run --project src/dotnet/Daisi.Llogos.Cli -- \
+    --model C:\GGUFS\Qwen3.5-0.8B-Q8_0.gguf \
+    --prompt "Hello, world" \
+    --attention sinks:64,4096
+
+# Hybrid GPU+CPU split — first 24 layers on GPU, rest on CPU
+dotnet run --project src/dotnet/Daisi.Llogos.Cli -- \
+    --model C:\GGUFS\Qwen3.5-0.8B-Q8_0.gguf \
+    --prompt "Hello" \
+    --backend cuda --hybrid-layers 24
+```
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="LoRA training" icon="graduation-cap" href="/guides/lora-training">
+    Fine-tune a GGUF model with native GPU LoRA training in under 30 seconds per epoch.
+  </Card>
+  <Card title="Long context" icon="scroll" href="/guides/long-context">
+    Flash attention, paged KV cache, and RAM offloading for 200K+ token contexts.
+  </Card>
+  <Card title="CLI reference" icon="list" href="/reference/cli/inference">
+    Complete reference for every flag, sampling parameter, and subcommand.
+  </Card>
+</CardGroup>

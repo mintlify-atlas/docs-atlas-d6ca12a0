@@ -1,0 +1,235 @@
+---
+title: "NVIDIA CUDA and Vulkan inference optimization techniques"
+description: "How LLogos matches and exceeds llama.cpp decode throughput on NVIDIA GPUs using dp4a, fused kernels, partial vocab, CUDA graphs, and Vulkan subgroup ops."
+keywords: ["cuda", "vulkan", "optimization", "dp4a", "inference", "throughput", "gguf", "llama.cpp"]
+---
+
+LLogos applies a battery of hardware-specific optimizations across CUDA and Vulkan backends to maximize throughput on GGUF quantized models. The result: LLogos exceeds llama.cpp decode throughput on 4 of 8 tested models — written entirely in managed C# with GPU kernels compiled via NVRTC and GLSL-to-SPIR-V at load time.
+
+## Benchmark results
+
+Measured on AMD Ryzen 9 9900X + NVIDIA RTX 5080, 128 decode tokens, FP16 KV cache. Compared against llama.cpp b8461 (CUDA build).
+
+| Model | Architecture | LLogos CUDA | llama.cpp CUDA | Ratio | LLogos Vulkan |
+|-------|-------------|------------:|---------------:|------:|--------------:|
+| Qwen3.5-0.8B Q8_0 | DeltaNet hybrid | **441** | 399 | **110%** | 156 |
+| TinyLlama 1.1B Q8_0 | LLaMA | **448** | 443 | **101%** | — |
+| Qwen3.5-4B Q8_0 | DeltaNet hybrid | **144** | 135 | **107%** | 73 |
+| Qwen3-8B Q8_0 | Standard attention | 91 | 92 | 99% | 56 |
+| DeepSeek R1 8B Q8_0 | LLaMA | 94 | 95 | 99% | — |
+| Qwen3-8B Q4_K_M | Standard attention | **127** | 138 | 92% | 54 |
+| Qwen3.5-9B Q8_0 | DeltaNet hybrid | **88** | 84 | **105%** | 53 |
+| Qwen3.5-9B Q4_0 | DeltaNet hybrid | 101 | 123 | 82% | 45 |
+
+<Tip>
+  Use `--bench` to measure prefill and decode performance separately. Prefill throughput is dominated by prompt length and matrix size; decode throughput is dominated by weight bandwidth and kernel efficiency.
+</Tip>
+
+The Q4_K_M gap (8%) has been reduced from 12% via fused SwiGLU matmul, Q6_K kernel optimization, and cooperative dp4a kernels. The remaining 4-bit gaps come from pipeline overhead and mixed-quant layer efficiency.
+
+<Tabs>
+  <Tab title="CUDA optimizations">
+
+## Partial vocabulary logit computation
+
+**The biggest surprise.** During greedy decode (`temperature=0`), the model computes logits for every token in the vocabulary — 152,064 tokens for Qwen3.5 — then picks the argmax. Common tokens (English words, Chinese characters, code, punctuation, numbers) all occupy the low end of the vocabulary. High-ID tokens are rare: unusual Unicode, specialized markers, model-specific control tokens.
+
+LLogos computes logits for only the first `VocabSize / 32` tokens (~4,752 out of 152,064) and runs argmax over that subset, skipping 97% of the `lm_head` matmul — the single largest matmul in the model (1.6 GB weight data for the 9B model).
+
+| Divisor | Tokens computed | Speed (9B Q4_0) |
+|--------:|----------------:|----------------:|
+| 1 | 152,064 | 90 tok/s |
+| 4 | 38,016 | 97 tok/s |
+| 32 | 4,752 | **100 tok/s** |
+| 512 | 297 | 100 tok/s |
+
+The speedup saturates at ~32× because the `lm_head` becomes negligible relative to 32 transformer layers. LLogos defaults to `/32` for the full speedup while keeping a comfortable margin of 4,752 candidate tokens.
+
+This works differently from top-K/top-P sampling: those filters are applied _after_ computing all logits and save nothing on compute. Partial vocab skips the compute — the GPU never reads weight data for excluded tokens.
+
+**Vocabulary frequency remapping:** To make this provably correct, LLogos remaps the vocabulary at load time by scoring each token (ASCII letters, CJK, digits = high; special control tokens = low), sorting by score, and permuting the embedding table and `lm_head` weight columns in-place. This one-time cost (~0.6 s) guarantees the first N token IDs are the N most useful tokens. Control with `--vocab-limit`.
+
+## dp4a integer dot product for 4-bit quantization
+
+For Q4_0 weights, the float dequant path extracts each 4-bit nibble via shift+mask+int-to-float, producing 701 PTX instructions per block vs 422 for Q8_0. This makes Q4_0 compute-bound despite reading less data.
+
+The `__dp4a` instruction computes `c += a[0]*b[0] + a[1]*b[1] + a[2]*b[2] + a[3]*b[3]` in a single clock for packed int8 operands. LLogos pre-quantizes the FP32 activation to Q8_1 format (int8 with per-block scale and sum), then uses dp4a for the nibble × quant dot product.
+
+### Architecture-adaptive dispatch
+
+dp4a is not universally faster. On NVIDIA Blackwell (SM 12.x), massive FP32 throughput makes the float nibble-extraction path competitive with dp4a + quantization overhead. On Turing, Ampere, and Ada, dp4a's 4× int8 throughput clearly wins.
+
+LLogos dispatches based on compute capability: Blackwell uses the float path when Q8_1 is not pre-computed, dp4a otherwise. Pre-Blackwell always uses dp4a.
+
+## Fused RmsNorm + Q8_1 quantization
+
+The dp4a path requires quantizing the activation to Q8_1 before each matmul group. Without fusion, this is a separate kernel launch — 64 per token (2 per layer × 32 layers), each reading 4096 floats, computing per-block max and sum, and writing 36-byte Q8_1 blocks.
+
+LLogos fuses this into the preceding RmsNorm kernel. RmsNorm already reads the hidden state, normalizes it, and writes output. The fused variant additionally quantizes the output to Q8_1 in the same pass — zero extra memory traffic, zero extra kernel launches.
+
+Three fused kernels cover all RmsNorm variants in the forward pass:
+
+- `rms_norm_residual_q8_1` (first layer)
+- `add_rms_norm_residual_q8_1` (layers 1–31)
+- `add_rms_norm_q8_1` (FFN pre-norm)
+
+The dp4a matmul checks a `_q8_1FusedReady` flag and skips the separate quantization step when the fused kernel has already prepared the data.
+
+## Fused MatMulSwiGLU for Q4_K FFN layers
+
+The FFN block computes `output = SiLU(gate_proj(x)) * up_proj(x)`. The standard pipeline runs three separate operations: gate matmul → up matmul → SwiGLU activation, each writing to global memory with a separate kernel launch.
+
+LLogos fuses all three into `dequant_matmul_swiGLU_q4_k`. For each output element `i`, the kernel computes both `dot(activation, gate_weights[i])` and `dot(activation, up_weights[i])` in the same thread block, applies `SiLU(gate) * up`, and writes the final result. Q8_1 activation data is loaded once and shared across both weight row reads.
+
+Uses the same cooperative dp4a design as the Q4_K v2 kernel (128 threads, 16 per super-block). Two sets of partial sums accumulate in parallel with negligible extra register pressure (~30 registers vs ~15 for single matmul).
+
+**Savings per FFN layer:** 2 fewer kernel launches, intermediate gate and up tensors never touch global memory, activation Q8_1 loaded once instead of twice. Over 36 layers: 72 fewer kernel launches and ~8 MB less intermediate traffic per token. Measured improvement: 125.4 → 127.4 tok/s on Qwen3 8B Q4_K_M (+1.6%).
+
+## Cooperative Q4_K dp4a kernel (v2)
+
+The original Q4_K float kernel uses 64 threads with 3 rows per block, giving ~70 registers per thread and only 2 warps for memory latency hiding.
+
+The v2 kernel (`dequant_matmul_q4_k_v2`) uses a cooperative design:
+
+- **128 threads** (4 warps), **1 row per block** — all threads cooperate on the same output row
+- **16 threads per super-block** — 4 threads per chunk, each handling 16 elements via dp4a
+- **~15 registers per thread** — 4× lower than the multi-row kernel
+- **16-thread warp reduction** via `__shfl_xor_sync` + 8-entry shared memory cross-group sum
+
+This enables much higher SM occupancy (up to 27 blocks vs 14 for the old kernel) and 4 warps for latency hiding. On Blackwell, the v2 kernel matches the multi-row float kernel (~125 tok/s). On pre-Blackwell GPUs with lower FP32 throughput, dp4a's 4× integer throughput advantage yields a measurable speedup.
+
+## Aligned block repacking
+
+GGUF stores Q8_0 blocks as 34 bytes (2-byte FP16 scale + 32 int8 quants). The quant data at byte offset 2 is not 4-byte aligned, forcing multiple byte loads instead of a single `uint32` load.
+
+At model load time, LLogos repacks to 36 bytes (2-byte scale + 2-byte padding + 32 quants). The quant data at offset 4 is now 4-byte aligned, enabling native `uint32` loads via `__ldg`. The same technique is applied to Q4_0 (18→20 bytes), aligning the 16-byte nibble array to a 4-byte boundary.
+
+## CUDA graph capture
+
+The entire forward pass (embedding lookup → 32 transformer layers → logit projection) is recorded as a single CUDA graph on the first token. Subsequent tokens replay the graph with a single `cuGraphLaunch` call, eliminating ~435 individual kernel launch overheads per token.
+
+Graph capture requires stable memory addresses across tokens: the Q8_1 scratch buffer is pre-allocated during model loading (not during graph recording), and all tensor addresses remain fixed.
+
+## Per-quantization row count tuning
+
+Each matmul kernel processes multiple output rows per CUDA block ("multi-row"). More rows means more activation reuse but also more registers per thread and lower occupancy. The optimal count varies per quantization type:
+
+| Quant | Optimal rows | Reason |
+|-------|:------------:|--------|
+| Q8_0 | 2 | Simple byte extraction — register pressure dominates |
+| Q4_0 | 2 | Same as Q8_0 (float path with nibble extraction) |
+| Q4_K | 3 | Complex scale unpacking, moderate register use |
+| Q6_K | 3 | Branch-free split loops, factored scale multiply, float4 activation loads |
+| Q4_1 | 8 | Simple with min offset, similar to Q4_0 |
+| Q5_K | 1 | Extremely complex — any multi-row configuration spills |
+
+Q4_K going from 4→3 rows produced a +21% speedup (99→120 tok/s on 8B Q4_K_M). More rows is not always better on modern GPUs with high register counts and deep pipelines.
+
+## Q6_K kernel optimization
+
+Q4_K_M models use mixed quantization: approximately 39% of weight data per layer is Q6_K (attention V projections, FFN down projections). The original Q6_K kernel had four inefficiencies: 10 rows per block (42+ registers per thread limiting occupancy), a per-element branch in the inner loop causing warp divergence, scalar activation loads (32 individual float reads), and per-element scale multiplications.
+
+The optimized kernel uses 3 rows per block, eliminates the branch by splitting into two 16-element loops, uses float4 vectorized activation loads (8 × 128-bit reads), and factors the scale multiply outside the inner loop. Improvement on Qwen3 8B Q4_K_M: 124 → 125.4 tok/s (+1.1%).
+
+## Additional CUDA techniques
+
+- **NVRTC with PTX disk cache** — kernels are JIT-compiled once and cached to disk; subsequent runs load cached PTX directly
+- **GPU-side argmax** — avoids D2H transfer of the full logit buffer; argmax runs as a reduction kernel on device
+- **cuBLAS F32 GEMV** — used for certain projection sizes where cuBLAS outperforms custom kernels
+- **Self-contained dispatch** — each quant type's `AdaptiveLaunch()` helper computes its own grid size, thread count, and shared memory to prevent cross-contamination from parameter tuning
+
+</Tab>
+  <Tab title="Vulkan optimizations">
+
+## Aligned Q8_0 repacking
+
+Vulkan uses the same 34→36 byte Q8_0 repacking as CUDA. The 4-byte aligned quant data at offset 4 enables native `uint32` loads through a `uint weight_u32[]` buffer view, replacing multiple byte loads.
+
+## uint32 buffer views
+
+Rather than reading quantized weight bytes individually, Vulkan shaders declare weight storage buffers as `uint32` arrays. This leverages hardware coalescing for 4-byte reads across the warp and avoids byte-extraction penalties on architectures with limited sub-word memory access.
+
+## Subgroup arithmetic reduction
+
+Vulkan 1.2 subgroup operations (`subgroupAdd`, `subgroupShuffle`) replace shared-memory reduction trees for the final dot product accumulation step. Subgroup ops execute entirely in registers — no shared memory allocation, no barrier synchronization, lower latency.
+
+## Multi-row workgroups
+
+Like CUDA multi-row kernels, Vulkan compute shaders process multiple output rows per workgroup to amortize the cost of loading the shared activation vector. The optimal row count per quant type matches the CUDA values — register pressure and occupancy trade-offs apply equally to SPIR-V shaders.
+
+## Fused composite operations
+
+LLogos implements a suite of fused Vulkan compute shaders that combine multiple operations into a single dispatch:
+
+| Shader | Operations fused |
+|--------|-----------------|
+| `RmsNormResidual` | Add residual + RmsNorm normalization |
+| `AddRmsNormResidual` | Add two residuals + RmsNorm normalization |
+| `AddRmsNorm` | Add residual + RmsNorm (FFN pre-norm variant) |
+| `SplitSwiGLU` | Split gate/up + SiLU activation + elementwise multiply |
+| `RepeatTile` | KV head tiling for grouped-query attention |
+| `ArgMax` | Full vocabulary argmax reduction |
+
+Each fusion eliminates at least one global memory roundtrip and one pipeline barrier between the constituent operations.
+
+## Quantized matmul and embedding shaders
+
+Dedicated SPIR-V compute shaders handle fused dequantize-and-multiply for every supported quantization format without an explicit dequantization pass:
+
+- **Q4_0 and Q4_1** — nibble extraction and scale multiply inline in the matmul inner loop
+- **Q5_K** — 5-bit high-bit array handling fused with scale unpacking
+- **Q4_K** — super-block scale + subscale unpacking fused with dp4a-style accumulation
+- **Embedding lookup** — Q8_0 embedding table with fused int8-to-float conversion
+
+The key design principle: dequantize inside each operation's inner loop, never write decompressed weights to global memory. This keeps memory traffic at the quantized data size throughout the forward pass.
+
+  </Tab>
+</Tabs>
+
+## Quantization kernel strategy
+
+LLogos follows a consistent principle across both backends: **dequantize inside ops, not upfront**. Every fused kernel reads quantized weight bytes directly and converts to float within the inner product loop, keeping global memory traffic at the compressed data size.
+
+This contrasts with the approach of writing a `dequantize` pass that expands all weights to FP32 or FP16 before the matmul. That approach doubles the memory traffic: once to read the quantized data, once more to read the expanded float data. Fused dequant-matmul reads each byte exactly once.
+
+For decode (single-token, M=1), this is unambiguously correct — there is no reuse opportunity across tokens. For batched prefill (M>1 tokens simultaneously), LLogos maintains a persistent FP16 weight cache so subsequent prefills avoid re-dequantization entirely.
+
+## What did not work
+
+**Early layer exit** — LLogos investigated predicting tokens from intermediate layer outputs. Layer predictions are chaotic and non-monotonic: the correct token may appear at layer 21, disappear at layers 22–25, and return at layer 31. Useful early exit requires auxiliary classification heads trained at intermediate layers — a training-time change not applicable to off-the-shelf GGUF models.
+
+**TF32 math mode** — `CUBLAS_TF32_TENSOR_OP_MATH` and `CUBLAS_COMPUTE_32F_FAST_16F` produced no measurable improvement; cuBLAS already selects tensor cores with default settings for FP16 GemmEx.
+
+**Fused gate+up FFN for batched prefill** — Concatenating FfnGate and FfnUp FP16 weights into a single `[2N×K]` matrix for one GemmEx call was slower than two separate calls; cuBLAS handles the larger matrix at similar throughput, and the D2D memcpy to build the fused weight negated any savings.
+
+## Reproducibility
+
+All benchmarks use:
+
+- **Hardware:** Intel Core i9-14900KF, NVIDIA GeForce RTX 5080 (16 GB)
+- **Software:** .NET 10, CUDA 13, llama.cpp b8461 (CUDA build)
+- **Models:** Qwen3.5 (0.8B, 4B, 9B DeltaNet hybrid), Qwen3 (8B standard attention), TinyLlama (1.1B LLaMA)
+- **Decode:** 128 tokens, greedy (`temperature=0`), short prompt to minimize KV cache overhead
+- **llama.cpp:** 3 runs averaged; LLogos: single run (GPU-bound, low variance)
+
+```bash
+# LLogos decode benchmark
+dotnet run --project src/Daisi.Llogos.Cli -c Release -- \
+  --model <path> --backend cuda --bench --prompt "Hello" --max-tokens 128
+
+# LLogos prefill benchmark (use a prompt that tokenizes to ~128 tokens)
+dotnet run --project src/Daisi.Llogos.Cli -c Release -- \
+  --model <path> --backend cuda --bench --prompt "<long text>" --max-tokens 5
+
+# llama.cpp equivalent
+llama-bench.exe -m <path> -t 1 -ngl 99 -p 128 -n 128 -r 3
+```
+
+<CardGroup cols={2}>
+  <Card title="LLogos Turbo" icon="compress" href="/optimization/llogos-turbo">
+    8–12× KV cache compression via Walsh-Hadamard rotation and QJL correction
+  </Card>
+  <Card title="CUDA backend" icon="microchip" href="/reference/backends/cuda">
+    P/Invoke design, NVRTC compilation, and the full fused kernel inventory
+  </Card>
+</CardGroup>

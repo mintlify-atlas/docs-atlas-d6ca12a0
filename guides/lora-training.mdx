@@ -1,0 +1,141 @@
+---
+title: 'Fine-tune GGUF models with native LoRA training'
+description: 'Train LoRA adapters directly on quantized GGUF models using GPU-accelerated AdamW — no dequantization, no Python, no external training frameworks.'
+---
+
+LLogos includes a native LoRA training engine that fine-tunes quantized GGUF models directly — no dequantization, no Python, no external training frameworks.
+
+LoRA (Low-Rank Adaptation) decomposes weight updates into low-rank matrices: `W' = W + (alpha/rank) * B @ A`, where `A` is `[rank × in]` and `B` is `[out × rank]`. Only `A` and `B` are trained — typically less than 1% of model parameters — while the base weights stay frozen and quantized.
+
+## Training walkthrough
+
+<Steps>
+  <Step title="Prepare your training data">
+    LLogos auto-detects the training data format from file content. Three formats are supported:
+
+    **Plain text** (`.txt`) — next-token prediction on raw text:
+    ```
+    The capital of France is Paris. Paris is known for the Eiffel Tower.
+    ```
+
+    **JSONL with `text` field** — full text with automatic ChatML prompt masking:
+    ```json
+    {"text": "The capital of France is Paris."}
+    ```
+
+    **JSONL with `prompt`/`completion` fields** — explicit prompt/completion split:
+    ```json
+    {"prompt": "What is the capital of France?", "completion": "The capital of France is Paris."}
+    ```
+
+    For ChatML-formatted data, LLogos detects the `<|im_start|>assistant\n` boundary automatically. Everything before that marker is masked, so the model only trains on completions — not on the user prompt or system instructions.
+
+    ```
+    Tokens:  [<|im_start|>user\n ... <|im_end|>\n<|im_start|>assistant\n | completion tokens ]
+    Loss:    [ masked  masked  masked  masked  masked  masked  masked     | computed  computed ]
+    ```
+  </Step>
+
+  <Step title="Run the training command">
+    Use the `train` subcommand with your model and dataset. The `--backend cuda` flag enables GPU-accelerated training:
+
+    ```bash
+    dotnet run --project src/Daisi.Llogos.Cli -- train \
+        --model C:\GGUFS\Qwen3.5-9B-Q8_0.gguf \
+        --data training_data.jsonl \
+        --output adapter.llra \
+        --backend cuda \
+        --rank 8 --alpha 16 \
+        --epochs 3 --lr 1e-4
+    ```
+
+    For Qwen 3.5 models (hybrid DeltaNet + attention), use `--targets qkvofd` to cover all layer types:
+
+    ```bash
+    dotnet run --project src/Daisi.Llogos.Cli -- train \
+        --model C:\GGUFS\Qwen3.5-0.8B-Q8_0.gguf \
+        --data training-data.jsonl \
+        --rank 8 --targets qkvofd --backend cuda
+    ```
+
+    The entire training pipeline runs on GPU — forward pass, backward pass, and AdamW optimizer — with no CPU round-trips.
+
+    <Note>
+      On an RTX 5080 with Qwen 3.5 9B Q8_0, training runs at approximately 30 seconds per epoch. GPU memory usage is around 2 GB at seq-len 128 and 2.5 GB at seq-len 256. CPU training is supported but runs 96× slower than CUDA.
+    </Note>
+  </Step>
+
+  <Step title="Run inference with the adapter">
+    Load the trained `.llra` adapter alongside the base model. LLogos dequantizes the base weights to F32, merges `(alpha/rank) * B @ A` into each targeted projection, and runs inference with the merged weights — zero adapter overhead at runtime:
+
+    ```bash
+    dotnet run --project src/Daisi.Llogos.Cli -- \
+        --model C:\GGUFS\Qwen3.5-9B-Q8_0.gguf \
+        --lora adapter.llra \
+        --prompt "Hello" --backend cuda
+    ```
+
+    Multiple adapters can be loaded and merged in order by passing `--lora` more than once.
+  </Step>
+</Steps>
+
+## Training options
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--rank` | `8` | LoRA rank. Higher rank = more capacity. Common values: 4, 8, 16, 32. |
+| `--alpha` | `16` | LoRA scaling alpha. Effective scale = `alpha / rank`. |
+| `--targets` | `qkvo` | Projection targets (see table below). |
+| `--lr` | `1e-4` | Learning rate. |
+| `--epochs` | `3` | Number of training epochs. |
+| `--seq-len` | `512` | Sequence length for training samples. |
+| `--warmup` | `50` | Linear warmup steps before full learning rate. |
+| `--weight-decay` | `0.01` | AdamW weight decay. |
+| `--max-grad-norm` | — | Maximum gradient norm for clipping. |
+| `--grad-accum` | — | Gradient accumulation steps. |
+| `--seed` | — | Random seed for reproducibility. |
+| `--save-every` | — | Save adapter checkpoint every N steps. |
+| `--log-every` | — | Print training loss every N steps. |
+| `--backend` | `cpu` | Compute backend: `cpu` or `cuda`. |
+
+## LoRA targets
+
+The `--targets` flag selects which weight projections receive LoRA adapters. Each character enables a different set of layers:
+
+| Flag | Targets | Description |
+|------|---------|-------------|
+| `q` | Attention Q | Query projection in standard attention layers |
+| `k` | Attention K | Key projection in standard attention layers |
+| `v` | Attention V | Value projection in standard attention layers |
+| `o` | Attention O | Output projection in standard attention layers |
+| `f` | FFN gate/up/down | Feed-forward network across all layers |
+| `d` | DeltaNet Q/K/V/out | DeltaNet projections in hybrid models (Qwen 3.5) |
+
+Use `--targets qkvo` for standard transformer models. Use `--targets qkvofd` for Qwen 3.5, which has both standard attention layers and DeltaNet layers.
+
+For Qwen 3.5's 28-layer hybrid architecture, the training engine detects the layer type from model metadata and dispatches accordingly:
+- Standard attention layers (6 out of 28) receive Q/K/V/O adapters and use batched attention forward with full backpropagation.
+- DeltaNet layers (22 out of 28) run the real DeltaNet recurrent forward pass — not an approximation — so that FFN LoRA adapters train on correct hidden states.
+
+## Adapter file format (.llra)
+
+Trained adapters are saved as `.llra` binary files. The format stores LoRA A/B matrices per layer alongside the configuration needed to apply them:
+
+```
++------------------+
+| Header           |
+|  - rank          |
+|  - alpha         |
+|  - layer count   |
++------------------+
+| Layer 0          |
+|  - name (string) |
+|  - A [rank × in] |
+|  - B [out × rank]|
++------------------+
+| Layer 1          |
+| ...              |
++------------------+
+```
+
+The file is self-contained — it records which projections were trained and at what rank, so inference can apply the adapter without any extra configuration flags.

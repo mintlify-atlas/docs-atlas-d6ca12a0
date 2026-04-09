@@ -1,0 +1,114 @@
+---
+title: 'LLogos inference engine — what it is and how it works'
+description: 'LLogos runs GGUF language models natively in C# and TypeScript across CPU, CUDA, Vulkan, and WebGPU with no Python and no wrapper libraries.'
+---
+
+LLogos is an inference engine that takes a trained AI model file in GGUF format and runs it to generate text, answer questions, or hold conversations. It is written entirely in C# and TypeScript with no Python dependency and no third-party wrapper libraries — every compute path goes directly to the hardware. You can run the same GGUF model on an NVIDIA GPU via CUDA, any GPU via Vulkan, a web browser via WebGPU, or a plain CPU via AVX2/AVX-512 SIMD, all from the same model file.
+
+## What is GGUF?
+
+GGUF (GPT Unified Format) is the binary file format for storing quantized large language model weights and metadata. It is the successor to GGML and GGJT and has become the standard interchange format for distributing quantized models. A GGUF file contains a 24-byte header, key-value metadata pairs (architecture name, context length, vocabulary), tensor descriptors, and the raw quantized weight bytes packed into blocks.
+
+LLogos reads GGUF v2 and v3 files directly using a pure C# parser. It supports 41 quantization types including F32, F16, BF16, Q8_0, Q4_0, Q4_1, Q4_K, Q5_K, Q6_K, Q3_K, Q2_K, I2_S (BitNet ternary), TQ1_0, and Q1_0/Q1_0_g128 (PrismML Bonsai 1-bit). Models are memory-mapped by default so no intermediate byte copies are made during loading.
+
+## Why LLogos instead of alternatives?
+
+Most inference tools for GGUF models are written in Python or use Python as a binding layer around a C++ core. LLogos takes a different approach:
+
+- **No Python.** The .NET library is a first-class native assembly. There is no Python process, no subprocess call, and no dependency on pip.
+- **Direct hardware access.** CUDA kernels are compiled via NVRTC and loaded through the CUDA Driver API with P/Invoke. Vulkan uses SPIR-V compute shaders. There are no managed GPU wrapper libraries in the call stack.
+- **C# native.** `Daisi.Llogos` is a .NET assembly you reference like any other NuGet package. The `IComputeBackend` / `ITensor` abstraction means the forward pass is backend-agnostic — the same model code runs on CPU, CUDA, and Vulkan.
+- **Browser-native TypeScript.** The `@daisinet/llogos-webgpu` package runs in Chrome 113+, Edge 113+, and Node.js via Dawn bindings. It uses 20+ WGSL compute shaders with zero native dependencies.
+
+## Supported backends
+
+| Backend | Hardware | Language | Status |
+|---------|----------|----------|--------|
+| CPU (AVX2/AVX-512) | Any x64 processor | C# | Priority |
+| CUDA | NVIDIA GPUs | C# | Priority |
+| Vulkan | NVIDIA, AMD, Intel GPUs | C# | Done |
+| WebGPU | Any GPU in browser or Node.js | TypeScript | Done |
+| Metal | Apple Silicon and Intel Mac | C# | Planned |
+
+The system automatically detects available hardware: it tries CUDA first, then Vulkan, then falls back to CPU. You can also select a backend explicitly via `--backend cuda|vulkan|cpu`.
+
+## Platform support
+
+| Platform | Backend | Language | Status |
+|----------|---------|----------|--------|
+| Windows x64 | CPU (AVX2/AVX-512) | C# | Priority |
+| Windows x64 | CUDA 13 (NVIDIA) | C# | Priority |
+| Windows x64 | Vulkan (NVIDIA/AMD/Intel) | C# | Done |
+| Browser | WebGPU (any GPU) | TypeScript | Done |
+| Linux x64 | CPU (AVX2/AVX-512) | C# | Planned |
+| Linux x64 | Vulkan (NVIDIA/AMD/Intel) | C# | Planned |
+| macOS arm64 | Metal (Apple Silicon) | C# | Planned |
+| macOS x64 | Metal (Intel/AMD) | C# | Planned |
+| iOS arm64 | Metal (XCFramework) | C# | Planned |
+| Android | WebGPU (Adreno/Mali) | TypeScript | Tested |
+
+## Supported architectures
+
+LLogos implements the full forward pass for each architecture family, including hybrid models that interleave DeltaNet linear attention with standard softmax attention:
+
+| Architecture | Key difference | Tested models |
+|---|---|---|
+| **LLaMA** | Baseline transformer, GQA, SwiGLU, RoPE | TinyLlama 1.1B, Llama 3, DeepSeek R1 8B |
+| **Qwen 2/2.5** | Attention biases on Q/K/V projections | Qwen2.5-0.5B, Qwen2.5-7B |
+| **Qwen 3** | Gated Q (DeInterleaveQ), per-head Q/K norms, thinking mode | Qwen3-8B, Bonsai-8B (1-bit) |
+| **Qwen 3.5** | Hybrid DeltaNet + standard attention | Qwen3.5-0.8B, 4B, 9B |
+| **BitNet** | Ternary I2_S weights (`{-1, 0, +1}`) | BitNet b1.58 |
+
+## Solution structure
+
+The repository is organized as two independent engines that share the same GGUF model files:
+
+```
+daisi-llogos/
+├── src/
+│   ├── dotnet/                      .NET inference engine
+│   │   ├── Daisi.Llogos/            Core library (GGUF, model, inference, tokenizer, GBNF grammar)
+│   │   ├── Daisi.Llogos.Training/   LoRA training (adapters, forward/backward, AdamW optimizer)
+│   │   ├── Daisi.Llogos.Cpu/        CPU backend (AVX2/AVX-512 SIMD)
+│   │   ├── Daisi.Llogos.Cuda/       NVIDIA CUDA backend (dp4a, fused kernels)
+│   │   ├── Daisi.Llogos.Vulkan/     Vulkan backend (SPIR-V shaders)
+│   │   ├── Daisi.Llogos.Cli/        Command-line interface
+│   │   └── tests/                   251+ unit and integration tests
+│   ├── bench/                       Next.js benchmark dashboard
+│   └── webgpu/                      Browser/Node.js engine (TypeScript)
+│       ├── src/                     Engine source (GGUF, GPU, model, tokenizer)
+│       ├── test/                    72 automated tests (including GPU via Dawn)
+│       └── package.json             @daisinet/llogos-webgpu
+└── docs/                            Architecture and reference documentation
+```
+
+## Daisi SDK dependency
+
+<Note>
+The `Daisi.Llogos` assembly depends on `IInferenceBackend` from the Daisi SDK. You must clone both repositories side by side under the same parent directory before building:
+
+```
+/daisinet/
+  daisi-dotnet-sdk/
+  daisi-llogos/
+```
+
+Clone `daisi-dotnet-sdk` first, then clone `daisi-llogos` next to it. The solution file resolves the reference by relative path.
+</Note>
+
+## Where to go next
+
+<CardGroup cols={2}>
+  <Card title="Quickstart: .NET" icon="square-terminal" href="/quickstart-dotnet">
+    Build and run your first inference session on CPU, CUDA, or Vulkan in under five minutes.
+  </Card>
+  <Card title="Quickstart: WebGPU" icon="globe" href="/quickstart-webgpu">
+    Run LLogos in the browser or Node.js with the TypeScript package.
+  </Card>
+  <Card title="Architecture" icon="sitemap" href="/concepts/architecture">
+    Understand the backend abstraction, data flow, and how the forward pass works.
+  </Card>
+  <Card title="CLI reference" icon="list" href="/reference/cli/inference">
+    Full reference for every command-line flag, sampling parameter, and subcommand.
+  </Card>
+</CardGroup>
